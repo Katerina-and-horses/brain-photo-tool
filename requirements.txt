@@ -1,0 +1,9 @@
+PySide6==6.11.2
+opencv-python-headless
+numpy
+pandas
+matplotlib
+pillow
+tifffile
+imagecodecs
+openpyxl
