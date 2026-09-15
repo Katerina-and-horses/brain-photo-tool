@@ -19,21 +19,22 @@ from .models import GroupConfig, MaskMode, SpecimenMask
 MIN_BLOB_AREA_PX = 200
 
 # во сколько раз разброс фона (устойчивая оценка через MAD) добавляется к медиане фона,
-# чтобы получить СТРОГИЙ порог — "здесь совершенно точно ткань, а не шум". Подобрано
-# опытным путём: этим порогом только находим уверенное ядро каждого пятна (кол-во
-# животных на фото считается по числу таких ядер), реальные границы среза — ниже, см.
-# GROW_SIGMA_MULTIPLIER.
+# чтобы получить порог яркости "это уже ткань, а не фон". Этим порогом находим все
+# пятна и считаем по ним количество животных/срезов на фото — должен быть строгим,
+# чтобы шум/пыль/блики не путались с животными.
 SEED_SIGMA_MULTIPLIER = 4.0
 
-# мягкий порог для РАСШИРЕНИЯ уже найденного ядра до его настоящей границы. У тусклых
-# срезов сигнал плавно спадает к фону, и на реальных фото заметная глазом (и измеримая:
-# ещё повышенная над фоном на несколько единиц) ткань остаётся за пределами строгого
-# порога — из-за этого площадь тусклых срезов занижалась, а край маски обрезал край
-# среза. Расширяем маску до этого мягкого порога, но ТОЛЬКО когда внутри рыхлой (по
-# мягкому порогу) области ровно одно строгое ядро — если их несколько (соседние срезы
-# на фото сблизились и их тусклые края соприкоснулись), расширение отключаем для всех
-# них, чтобы не слить два разных среза в одну маску.
+# мягкий порог для ЛОКАЛЬНОГО расширения уже найденного пятна до его настоящей, но
+# тусклой границы (у срезов мозга сигнал плавно спадает к фону, и заметная глазом
+# ткань оставалась за пределами строгого порога — площадь занижалась, край обрезался).
 GROW_SIGMA_MULTIPLIER = 1.5
+
+# на сколько пикселей ядро пятна можно расширить при поиске тусклого края. Это ГЛАВНАЯ
+# защита от "утечки" в посторонние яркие объекты (блики, пыль, соседние пятна) —
+# расширение идёт не по связности через весь кадр (как при обычном гистерезисном
+# пороге), а только в пределах этого фиксированного радиуса вокруг исходного ядра,
+# даже если мягкий порог где-то дальше тоже пройден.
+GROW_MARGIN_PX = 15
 
 
 @dataclass
@@ -56,24 +57,14 @@ def _clean_binary(binary_bool: np.ndarray) -> np.ndarray:
 def detect_blobs(
     image: np.ndarray,
     min_area_px: int = MIN_BLOB_AREA_PX,
-    seed_sigma_multiplier: float = SEED_SIGMA_MULTIPLIER,
-    grow_sigma_multiplier: float = GROW_SIGMA_MULTIPLIER,
+    sigma_multiplier: float = SEED_SIGMA_MULTIPLIER,
 ) -> list[Blob]:
-    """Находит светлые пятна на тёмном фоне — гистерезисный порог в два уровня.
-
-    Строгий порог (`seed_sigma_multiplier`) находит уверенные "ядра" пятен — по ним же
-    считается количество животных/срезов на фото, шум/пыль сюда не должны попадать.
-    Мягкий порог (`grow_sigma_multiplier`) очерчивает более широкую область, до которой
-    ядро можно безопасно расширить, чтобы захватить настоящий, но тусклый диффузный край
-    ткани. Расширение применяется только когда в рыхлой области ровно одно ядро —
-    иначе (несколько ядер срослись по мягкому порогу) остаёмся на строгой границе,
-    чтобы не склеить два соседних среза в одну маску.
+    """Находит светлые пятна на тёмном фоне (единый строгий порог).
 
     Порог считается от фактического фона кадра (медиана + устойчивый разброс через MAD),
-    а не через Otsu на нормализованном 0-255 диапазоне: у флуоресцентных снимков сигнал
-    часто представляет собой яркое ядро с плавно затухающим, но реальным диффузным краем
-    ткани, а Otsu на глобально растянутом гистограммой кадре (искажённом яркими точками
-    пыли/бликов) отсекал именно этот край, занижая измеряемую площадь.
+    а не через Otsu на нормализованном 0-255 диапазоне — так надёжнее при бликах/пыли на
+    кадре. Даёт уверенное "ядро" каждого пятна; тусклый диффузный край (для срезов) можно
+    затем безопасно добрать функцией `grow_blob_to_soft_edge`.
     """
     arr = image.astype(np.float32)
     blurred = cv2.GaussianBlur(arr, (5, 5), 0)
@@ -81,43 +72,74 @@ def detect_blobs(
     median = float(np.median(blurred))
     mad = float(np.median(np.abs(blurred - median)))
     robust_std = 1.4826 * mad if mad > 0 else float(np.std(blurred))
-    seed_threshold = median + seed_sigma_multiplier * robust_std
-    grow_threshold = median + grow_sigma_multiplier * robust_std
+    threshold = median + sigma_multiplier * robust_std
 
-    seed_binary = _clean_binary(blurred >= seed_threshold)
-    grow_binary = _clean_binary(blurred >= grow_threshold)
-
-    n_seed, seed_labels, seed_stats, seed_centroids = cv2.connectedComponentsWithStats(
-        seed_binary, connectivity=8
-    )
-    n_grow, grow_labels, _, _ = cv2.connectedComponentsWithStats(grow_binary, connectivity=8)
-
-    valid_seed_ids = [
-        lbl for lbl in range(1, n_seed) if seed_stats[lbl, cv2.CC_STAT_AREA] >= min_area_px
-    ]
-
-    grow_to_seeds: dict[int, list[int]] = {}
-    for sl in valid_seed_ids:
-        cx, cy = seed_centroids[sl]
-        gl = int(grow_labels[int(round(cy)), int(round(cx))])
-        grow_to_seeds.setdefault(gl, []).append(sl)
+    binary = _clean_binary(blurred >= threshold)
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
 
     blobs: list[Blob] = []
-    for gl, seeds_in_group in grow_to_seeds.items():
-        if len(seeds_in_group) == 1 and gl != 0:
-            mask = grow_labels == gl
-            area = int(mask.sum())
-            if area < min_area_px:
-                continue
-            ys, xs = np.nonzero(mask)
-            blobs.append(Blob(mask=mask, centroid=(float(xs.mean()), float(ys.mean())), area=area))
-        else:
-            for sl in seeds_in_group:
-                mask = seed_labels == sl
-                cx, cy = seed_centroids[sl]
-                area = int(seed_stats[sl, cv2.CC_STAT_AREA])
-                blobs.append(Blob(mask=mask, centroid=(float(cx), float(cy)), area=area))
+    for label in range(1, num_labels):  # label 0 = фон
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < min_area_px:
+            continue
+        mask = labels == label
+        cx, cy = centroids[label]
+        blobs.append(Blob(mask=mask, centroid=(float(cx), float(cy)), area=area))
     return blobs
+
+
+def grow_blob_to_soft_edge(
+    image: np.ndarray,
+    blob: Blob,
+    other_blobs: list[Blob] = (),
+    grow_sigma_multiplier: float = GROW_SIGMA_MULTIPLIER,
+    margin_px: int = GROW_MARGIN_PX,
+) -> Blob:
+    """Расширяет уже найденное пятно до его настоящей, но тусклой границы.
+
+    Расширение ограничено фиксированным радиусом `margin_px` вокруг исходного ядра
+    (дилатация ядра ∩ мягкий порог) — то есть не может "утечь" по связности через весь
+    кадр в далёкий блик, пыль или соседнее пятно, даже если между ними и правда есть
+    сплошная полоска пикселей выше мягкого порога. Используется только там, где реальная
+    граница объекта размытая (срезы) — для черт с чёткой геометрией (например, носовая
+    часть черепа, где форма пятна важна для поиска "талии") не применяется.
+
+    `other_blobs` — все ОСТАЛЬНЫЕ найденные на этом фото пятна (например, соседние
+    срезы того же животного). Их расширение на тот же радиус `margin_px` исключается
+    из зоны роста — иначе если два среза сближены (расстояние между ними меньше
+    ~2×margin_px, а тусклая "дымка" между ними и правда выше мягкого порога, что для
+    соседних срезов одного препарата обычное дело), спорная полоска между ними попала
+    бы в зону роста ОБОИХ одновременно, и одни и те же пиксели дублировались бы в двух
+    масках сразу (исключать только чужое ядро недостаточно — спорная зона шире ядра).
+    """
+    arr = image.astype(np.float32)
+    blurred = cv2.GaussianBlur(arr, (5, 5), 0)
+    median = float(np.median(blurred))
+    mad = float(np.median(np.abs(blurred - median)))
+    robust_std = 1.4826 * mad if mad > 0 else float(np.std(blurred))
+    grow_threshold = median + grow_sigma_multiplier * robust_std
+
+    grow_binary = _clean_binary(blurred >= grow_threshold) > 0
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * margin_px + 1, 2 * margin_px + 1))
+
+    # исключаем не только ядра соседей, а их расширение на ТОТ ЖЕ радиус margin_px —
+    # иначе спорная зона между двумя близкими пятнами (тусклая "дымка" между ними,
+    # выше мягкого порога, но не входящая ни в одно ядро) исключалась бы только из
+    # чужого ядра, но не из чужой зоны роста, и одни и те же пиксели дублировались бы
+    # сразу в обеих выращенных масках. Симметричное исключение оставляет спорную
+    # полоску посередине НИЧЬЕЙ — консервативная недооценка с обеих сторон, зато без
+    # пересечения и двойного счёта площади/яркости.
+    others_mask = np.zeros_like(blob.mask)
+    for ob in other_blobs:
+        others_mask |= cv2.dilate(ob.mask.astype(np.uint8), kernel) > 0
+    grow_binary &= ~others_mask
+
+    dilated = cv2.dilate(blob.mask.astype(np.uint8), kernel) > 0
+
+    grown = (dilated & grow_binary) | blob.mask
+    ys, xs = np.nonzero(grown)
+    return Blob(mask=grown, centroid=(float(xs.mean()), float(ys.mean())), area=int(grown.sum()))
 
 
 def _split_into_columns(blobs: list[Blob], cols: int) -> list[list[Blob]]:
@@ -193,18 +215,62 @@ def assign_blobs_to_grid(
     return assignment, resolved_rows, warning
 
 
+def _split_by_largest_y_gap(blobs: list[Blob]) -> tuple[list[Blob], list[Blob]]:
+    """Делит пятна на верхнюю и нижнюю полосу по самому большому разрыву по Y.
+
+    Используется, чтобы отделить ряд черепов (сверху) от ряда целых мозгов (снизу) на
+    фото «череп и мозг» по фактическому расположению на КОНКРЕТНОМ фото, а не считать,
+    что достаточно взять "самое верхнее пятно в каждой колонке" — если у одного черепа
+    носовая часть слишком тусклая и не находится вообще, "самым верхним" в этой колонке
+    ошибочно окажется мозг снизу.
+
+    Порог "заметности" самого большого разрыва сравнивается с типичным разрывом ВНУТРИ
+    ряда (между соседними черепами или соседними мозгами) — он на реальных фото на
+    порядок меньше разрыва МЕЖДУ рядами и не зависит от формы/вытянутости конкретного
+    пятна (в отличие от высоты пятна — на практике черепа часто вытянуты почти на всю
+    высоту своего ряда, вплотную к границе с рядом мозгов, так что сравнение с высотой
+    пятна ненадёжно). При подсчёте типичного разрыва сам оцениваемый (самый большой)
+    разрыв исключается — иначе при малом числе пятен медиана вырождается в сам этот
+    разрыв, и он почти никогда не признаётся "достаточно большим".
+
+    Если пятен всего два (напр. один череп + один его мозг — весь кадр с одним
+    животным, `cols=1`) — сравнивать не с чем, и здесь мы просто делим по этому
+    единственному разрыву: на фото «череп и мозг» два пятна почти всегда и есть ровно
+    эта пара. Вызывающий код (`assign_rostral_blobs_to_grid`) в этом случае явно
+    предупреждает пользователя о низкой уверенности.
+
+    Если пятно всего одно — делить нечего, но и уверенности в том, что это череп,
+    а не мозг, тоже нет (см. предупреждение там же).
+    """
+    if len(blobs) < 2:
+        return list(blobs), []
+    ordered = sorted(blobs, key=lambda b: b.centroid[1])
+    gaps = [(ordered[i + 1].centroid[1] - ordered[i].centroid[1], i) for i in range(len(ordered) - 1)]
+    gap, idx = max(gaps, key=lambda g: g[0])
+
+    other_gaps = [g for g, i in gaps if i != idx]
+    if other_gaps:
+        threshold = max(float(np.median(other_gaps)) * 2.0, 30.0)
+        if gap < threshold:
+            return ordered, []
+
+    return ordered[: idx + 1], ordered[idx + 1 :]
+
+
 def assign_rostral_blobs_to_grid(
     blobs: list[Blob], cols: int
 ) -> tuple[dict[tuple[int, int], Blob], str | None]:
     """Раскладка пятен по животным для режима «носовая часть черепа».
 
     На фото «череп и мозг» под каждым черепом лежит ещё и целый мозг — в этом режиме
-    он не анализируется вообще, это отдельный этап (срезы). Поэтому в отличие от
-    `assign_blobs_to_grid` здесь на каждое животное берётся РОВНО одно, самое верхнее
-    пятно в колонке (черепа всегда лежат выше мозгов на фото) — всё, что ниже,
-    осознанно отбрасывается и не считается ни срезом, ни ошибкой/недостачей.
+    он не анализируется вообще, это отдельный этап (срезы). Сначала все пятна на фото
+    делятся на верхнюю полосу (черепа) и нижнюю (мозги) по самому большому разрыву по Y
+    (см. `_split_by_largest_y_gap`) — это надёжнее, чем "самое верхнее пятно в колонке":
+    если у одного черепа носовая часть не нашлась вообще, колонка просто останется
+    пустой (доразметить вручную), а не подхватит мозг снизу как замену черепу.
     """
-    columns = _split_into_columns(blobs, cols)
+    top_band, bottom_band = _split_by_largest_y_gap(blobs)
+    columns = _split_into_columns(top_band, cols)
 
     warning: str | None = None
     missing = [i + 1 for i, c in enumerate(columns) if not c]
@@ -213,6 +279,16 @@ def assign_rostral_blobs_to_grid(
         warning = (
             f"Не для всех животных нашёлся череп на фото (ожидалось {cols}, "
             f"пятен в колонках: {counts}). Недостающие ячейки нужно доразметить вручную."
+        )
+    elif not bottom_band:
+        # разрыв между рядом черепов и рядом мозгов не нашёлся (мало пятен на фото —
+        # например, один череп вообще не даёт сигнала, и сравнивать не с чем) — не можем
+        # быть уверены, что каждое найденное пятно действительно череп, а не мозг
+        warning = (
+            "Не удалось надёжно отличить ряд черепов от ряда мозгов на этом фото "
+            "(слишком мало найденных пятен, чтобы сравнить их расположение). "
+            "Автоматическая обводка ниже может ошибочно относиться к мозгу вместо "
+            "черепа — обязательно проверьте эту разметку вручную."
         )
 
     assignment: dict[tuple[int, int], Blob] = {}
@@ -308,11 +384,14 @@ def compute_rostral_cut(
     kernel = np.ones(smooth_window) / smooth_window
     smoothed = np.convolve(counts, kernel, mode="same")
 
-    tip_start_w = float(smoothed[: max(1, n_bins // 10)].mean())
-    tip_end_w = float(smoothed[-max(1, n_bins // 10):].mean())
-
-    # переориентируем профиль так, чтобы нос (более узкий конец) был слева (индекс 0)
-    if tip_start_w <= tip_end_w:
+    # переориентируем профиль так, чтобы нос был слева (индекс 0). По протоколу съёмки
+    # черепа на фото «череп и мозг» всегда лежат носом вверх (к меньшим Y на кадре) —
+    # используем это напрямую (знак Y-компоненты главной оси), а не пытаемся определить
+    # направление по ширине профиля на кончиках. Ширина ненадёжна: у части черепов
+    # противоположный (каудальный) конец среза тоже сужается (например, торчащий
+    # обрубок спинного мозга) и тогда оказывается ещё уже носа — по ширине его и
+    # приняли бы за нос, и в "носовую" часть попала бы почти вся мозговая коробка.
+    if main_axis[1] >= 0:
         direction = 1
         profile = smoothed
     else:
@@ -369,11 +448,13 @@ def build_masks_for_image(
                     )
                 )
             elif group.mode == MaskMode.WHOLE_BLOB:
+                other_blobs = [b for b in blobs if b is not blob]
+                grown = grow_blob_to_soft_edge(image, blob, other_blobs)
                 masks.append(
                     SpecimenMask(
                         animal_index=animal_index,
                         slice_index=slice_index,
-                        mask=blob.mask,
+                        mask=grown.mask,
                     )
                 )
             else:  # ROSTRAL_CUT

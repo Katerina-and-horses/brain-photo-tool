@@ -313,6 +313,11 @@ class ResultsTab(QWidget):
         refresh_btn.clicked.connect(self._refresh_table)
         top_row.addWidget(refresh_btn)
 
+        top_row.addWidget(QLabel("Что анализируем:"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.currentIndexChanged.connect(self._refresh_table)
+        top_row.addWidget(self.mode_combo)
+
         self.average_checkbox = QCheckBox(
             "Показывать таблицу, усреднённую по животным (не влияет на статистику ниже — "
             "сравнение групп ВСЕГДА считается по животным, а не по отдельным срезам)"
@@ -371,15 +376,45 @@ class ResultsTab(QWidget):
     def _current_metric_key(self) -> str:
         return self.metric_combo.currentText().split(" ")[0]
 
+    def _selected_mode(self) -> str | None:
+        return self.mode_combo.currentData()
+
+    def _mode_filtered(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Оставляет только строки выбранного режима («что обводили»).
+
+        Срез мозга и носовая часть черепа — принципиально разные измерения, даже если
+        пользователь назвал обе группы одинаково (например, добавил и папку «череп и
+        мозг», и папку «срезы» одного животного под одним и тем же именем группы). Без
+        этого фильтра они бы молча усреднились/сравнились вместе, что бессмысленно.
+        """
+        mode = self._selected_mode()
+        if mode is None or df.empty or "mode" not in df.columns:
+            return df
+        return df[df["mode"] == mode]
+
     def _refresh_table(self) -> None:
         all_rows: list[MeasurementRow] = []
         for review in self.reviews:
             all_rows.extend(measure_shot(review))
         self.slice_df = rows_to_dataframe(all_rows)
+
+        present_modes = [m for m in self.slice_df.get("mode", pd.Series(dtype=str)).unique() if m]
+        current = self.mode_combo.currentData()
+        self.mode_combo.blockSignals(True)
+        self.mode_combo.clear()
+        for m in sorted(present_modes):
+            self.mode_combo.addItem(MODE_LABELS.get(MaskMode(m), m), m)
+        if current is not None:
+            idx = self.mode_combo.findData(current)
+            if idx >= 0:
+                self.mode_combo.setCurrentIndex(idx)
+        self.mode_combo.blockSignals(False)
+
+        filtered = self._mode_filtered(self.slice_df)
         if self.average_checkbox.isChecked():
-            df = per_animal_average(self.slice_df)
+            df = per_animal_average(filtered)
         else:
-            df = self.slice_df
+            df = filtered
         self.current_df = df
         self._show_dataframe(df)
 
@@ -404,9 +439,10 @@ class ResultsTab(QWidget):
         QMessageBox.information(self, "Готово", f"Таблица сохранена:\n{path}")
 
     def _animal_df(self) -> pd.DataFrame:
-        """Таблица для статистики — ВСЕГДА агрегированная по животным, независимо от
-        того, что сейчас показано в таблице выше (срез — не независимое наблюдение)."""
-        return per_animal_average(self.slice_df)
+        """Таблица для статистики — ВСЕГДА агрегированная по животным (срез — не
+        независимое наблюдение) и ВСЕГДА только по выбранному режиму («что
+        анализируем») — иначе срезы и носовые части черепа могли бы сравниться вместе."""
+        return per_animal_average(self._mode_filtered(self.slice_df))
 
     def _run_comparison(self) -> None:
         animal_df = self._animal_df()
@@ -425,6 +461,23 @@ class ResultsTab(QWidget):
             f"Группы: {', '.join(f'{g} (n={result.n_per_group[g]})' for g in result.groups)}",
             f"Общий p-value: {result.p_value:.4f}" + ("  (есть значимое различие, p < 0.05)" if result.p_value < 0.05 else "  (значимого различия не обнаружено)"),
         ]
+
+        if metric in ("mean_intensity", "std_intensity") and "exposure_ms" in animal_df.columns:
+            compared = animal_df[animal_df["group"].isin(result.groups)]
+            per_group_exposures = {
+                g: sorted(set(compared.loc[compared["group"] == g, "exposure_ms"].dropna()))
+                for g in result.groups
+            }
+            all_exposures = sorted({e for exps in per_group_exposures.values() for e in exps})
+            if len(all_exposures) > 1:
+                details = ", ".join(f"{g}: {exps} мс" for g, exps in per_group_exposures.items())
+                lines.append(
+                    f"\nВНИМАНИЕ: группы сняты на РАЗНОЙ выдержке ({details}) — программа "
+                    "сама выбирает наибольшую незасвеченную выдержку для каждого кадра "
+                    "отдельно. Сравнение яркости между группами при разной выдержке может "
+                    "быть искажено (более долгая выдержка — систематически выше сигнал), "
+                    "даже если реального биологического различия нет."
+                )
         min_p = max((pw.min_possible_p for pw in result.pairwise), default=0.0)
         if min_p > 0.05:
             lines.append(

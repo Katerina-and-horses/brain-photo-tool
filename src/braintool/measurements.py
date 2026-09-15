@@ -28,6 +28,8 @@ def measure_shot(review: ShotReview) -> list[MeasurementRow]:
                 mean_intensity=float(values.mean()),
                 std_intensity=float(values.std()),
                 source_file=review.shot.display_name,
+                mode=review.shot.group.mode.value,
+                exposure_ms=review.shot.chosen_exposure,
             )
         )
     return rows
@@ -40,6 +42,7 @@ def rows_to_dataframe(rows: list[MeasurementRow]) -> pd.DataFrame:
             columns=[
                 "group", "animal_index", "slice_index", "area_px",
                 "mean_intensity", "std_intensity", "source_file",
+                "mode", "exposure_ms",
             ]
         )
     return df
@@ -71,7 +74,10 @@ def per_animal_average(df: pd.DataFrame) -> pd.DataFrame:
     """
     if df.empty:
         return df
-    key_cols = ["group", "source_file", "animal_index"]
+    # mode — в ключ группировки: даже если пользователь случайно назвал две группы
+    # одинаково (например, папку "череп и мозг" и папку "срезы" одного животного назвал
+    # одним и тем же именем группы), их измерения не должны усредниться в одну строку
+    key_cols = ["group", "mode", "source_file", "animal_index"]
     out_rows: list[dict] = []
     for key, g in df.groupby(key_cols, sort=False):
         n = g["area_px"].to_numpy(dtype=np.float64)
@@ -88,6 +94,7 @@ def per_animal_average(df: pd.DataFrame) -> pd.DataFrame:
         row["area_px"] = float(g["area_px"].mean())
         row["mean_intensity"] = pooled_mean
         row["std_intensity"] = float(np.sqrt(max(pooled_var, 0.0)))
+        row["exposure_ms"] = g["exposure_ms"].iloc[0]
         out_rows.append(row)
     return pd.DataFrame(out_rows)
 
