@@ -104,10 +104,13 @@ class MaskCanvas(QWidget):
         pixmap = QPixmap.fromImage(qimg)
         painter.drawPixmap(self._draw_rect.toRect(), pixmap)
 
-        # ручки линии отреза показываем только для активной (выбранной) маски
+        # черепа на фото не лежат идеально по линейке, поэтому у каждого животного
+        # своя независимая линия отреза — показываем и даём тянуть их ВСЕ сразу,
+        # а не только у активного животного (иначе остальные 4 не видно и не поправить)
         active = self._active_mask()
-        if active is not None and active.cut_line is not None:
-            self._draw_handles(painter, active)
+        for m in self.masks:
+            if m.cut_line is not None:
+                self._draw_handles(painter, m, is_active=(m is active))
 
         painter.end()
 
@@ -122,20 +125,26 @@ class MaskCanvas(QWidget):
                 rgb[sel] = rgb[sel] * (1 - alpha) + color * alpha
         return np.ascontiguousarray(np.clip(rgb, 0, 255).astype(np.uint8))
 
-    def _draw_handles(self, painter: QPainter, m: SpecimenMask) -> None:
+    def _draw_handles(self, painter: QPainter, m: SpecimenMask, is_active: bool) -> None:
         assert m.cut_line is not None
+        # активная линия — яркая и толще, остальные — притушенные, чтобы не мешали
+        # глазу, но были видны и доступны для перетаскивания напрямую с фото
+        line_alpha = 255 if is_active else 120
+        line_width = 2 if is_active else 1
+        handle_radius = 6 if is_active else 4
+
         for p in m.cut_line:
             sx = self._draw_rect.x() + p[0] * self._scale
             sy = self._draw_rect.y() + p[1] * self._scale
-            painter.setPen(QPen(QColor(255, 255, 255), 2))
-            painter.setBrush(QBrush(QColor(255, 255, 255, 180)))
-            painter.drawEllipse(QPointF(sx, sy), 6, 6)
+            painter.setPen(QPen(QColor(255, 255, 255, line_alpha), line_width))
+            painter.setBrush(QBrush(QColor(255, 255, 255, line_alpha if is_active else 90)))
+            painter.drawEllipse(QPointF(sx, sy), handle_radius, handle_radius)
         p1, p2 = m.cut_line
         sx1 = self._draw_rect.x() + p1[0] * self._scale
         sy1 = self._draw_rect.y() + p1[1] * self._scale
         sx2 = self._draw_rect.x() + p2[0] * self._scale
         sy2 = self._draw_rect.y() + p2[1] * self._scale
-        painter.setPen(QPen(QColor(255, 255, 255), 2, Qt.PenStyle.DashLine))
+        painter.setPen(QPen(QColor(255, 255, 255, line_alpha), line_width, Qt.PenStyle.DashLine))
         painter.drawLine(QPointF(sx1, sy1), QPointF(sx2, sy2))
 
     # ---------- взаимодействие мышью ----------
@@ -145,14 +154,19 @@ class MaskCanvas(QWidget):
         if img_pt is None:
             return
 
-        active_mask = self._active_mask()
-        if active_mask is not None and active_mask.cut_line is not None:
-            m = active_mask
+        # ручки видны у всех животных сразу (не только у активного) — ищем среди всех,
+        # чтобы можно было потянуть за нужный череп прямо на фото, не щёлкая сначала
+        # по нему в списке слева; это заодно и переключает активное животное
+        for m in self.masks:
+            if m.cut_line is None:
+                continue
             for idx, p in enumerate(m.cut_line):
                 dx = (p[0] - img_pt[0]) * self._scale
                 dy = (p[1] - img_pt[1]) * self._scale
                 if (dx * dx + dy * dy) ** 0.5 <= HANDLE_HIT_RADIUS_PX:
                     self._dragging_handle = (m, idx)
+                    self.active_key = (m.animal_index, m.slice_index)
+                    self.update()
                     return
 
         self._dragging_brush = True
