@@ -347,6 +347,16 @@ class ResultsTab(QWidget):
         controls_row.addStretch(1)
         stats_layout.addLayout(controls_row)
 
+        multi_metric_note = QLabel(
+            "Учтите: площадь, средняя яркость и разброс яркости — три разных вопроса к одним "
+            "и тем же группам. Если вы проверяете все три подряд в поисках значимого различия, "
+            "относитесь к этому как к одной серии из 3 сравнений (риск случайно найти "
+            "«значимость» растёт), а не выбирайте после факта только тот показатель, где p < 0.05."
+        )
+        multi_metric_note.setWordWrap(True)
+        multi_metric_note.setStyleSheet("color: #666666; font-style: italic;")
+        stats_layout.addWidget(multi_metric_note)
+
         self.stats_output = QTextEdit()
         self.stats_output.setReadOnly(True)
         self.stats_output.setMaximumHeight(160)

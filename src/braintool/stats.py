@@ -48,6 +48,13 @@ def compare_groups(df: pd.DataFrame, metric: str) -> ComparisonResult:
 
     if len(groups) < 2:
         raise ValueError("Нужно минимум 2 группы для сравнения")
+    empty_groups = [g for g, n in n_per_group.items() if n == 0]
+    if empty_groups:
+        raise ValueError(
+            "В группе(ах) " + ", ".join(f"«{g}»" for g in empty_groups) + " нет ни одного "
+            f"животного с посчитанным показателем «{metric}» (например, для него у всех "
+            "принятых масок площадь оказалась нулевой) — сравнение невозможно."
+        )
 
     if len(groups) == 2:
         n1, n2 = len(samples[0]), len(samples[1])
