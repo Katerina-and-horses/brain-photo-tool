@@ -1,6 +1,7 @@
 build/
 dist/
 build_venv/
+программа/
 *.log
 __pycache__/
 *.pyc
