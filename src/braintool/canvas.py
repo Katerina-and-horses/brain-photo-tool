@@ -91,6 +91,13 @@ class MaskCanvas(QWidget):
         или предварительная правка кистью)."""
         if m.polygon is None and m.mask.any():
             m.polygon = mask_to_polygon(m.mask)
+            # полигон — самостоятельное векторное представление формы; линия
+            # отреза (ROSTRAL_CUT), если она была, в режиме точек не тянется
+            # (mousePressEvent до её хит-теста не доходит) и только рисовалась
+            # бы поверх контура полигона, загромождая картинку — отвязываем,
+            # как и кисть уже отвязывает маску от cut_line/source_blob
+            m.cut_line = None
+            m.source_blob = None
 
     def _ensure_all_polygons(self) -> None:
         """Полигоны нужны у ВСЕХ масок сразу (не только активной) — иначе при
