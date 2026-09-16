@@ -40,14 +40,19 @@ class ProjectTab(QWidget):
         info = QLabel(
             "Добавьте по одной папке на каждую группу животных. Для каждой папки укажите:\n"
             "— что обводить (весь срез мозга или носовую часть черепа сверху);\n"
-            "— сколько животных на одном фото (по горизонтали, слева направо).\n"
+            "— сколько животных на одном фото (по горизонтали, слева направо);\n"
+            "— контрольная это группа или опытная (для сравнения «контроль vs опыт»);\n"
+            "— при желании — произвольное условие (например, дата съёмки), чтобы потом "
+            "сравнить группы «все со всеми» по этой метке.\n"
             "Количество срезов/повторов на одно животное программа определяет сама по фото."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
 
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Группа", "Папка", "Что обводить", "Животных в ряд"])
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(
+            ["Группа", "Папка", "Что обводить", "Животных в ряд", "Контроль?", "Условие (метка)"]
+        )
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setVisible(False)
         layout.addWidget(self.table)
@@ -89,6 +94,16 @@ class ProjectTab(QWidget):
         cols_spin.setValue(5)  # в лаборатории в группе обычно 5 животных
         self.table.setCellWidget(row, 3, cols_spin)
 
+        control_checkbox = QCheckBox()
+        control_cell = QWidget()
+        control_layout = QHBoxLayout(control_cell)
+        control_layout.addWidget(control_checkbox)
+        control_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        control_layout.setContentsMargins(0, 0, 0, 0)
+        self.table.setCellWidget(row, 4, control_cell)
+
+        self.table.setItem(row, 5, QTableWidgetItem(""))
+
     def _remove_selected(self) -> None:
         rows = sorted({idx.row() for idx in self.table.selectedIndexes()}, reverse=True)
         for r in rows:
@@ -101,11 +116,14 @@ class ProjectTab(QWidget):
             folder = self.table.item(row, 1).text()
             mode_label = self.table.cellWidget(row, 2).currentText()
             cols = self.table.cellWidget(row, 3).value()
+            is_control = self.table.cellWidget(row, 4).findChild(QCheckBox).isChecked()
+            condition_item = self.table.item(row, 5)
+            condition = condition_item.text().strip() if condition_item else ""
             try:
                 groups.append(
                     GroupConfig(
                         name=name, folder=Path(folder), mode=MODE_BY_LABEL[mode_label],
-                        cols=cols,
+                        cols=cols, is_control=is_control, condition=condition,
                     )
                 )
             except Exception as exc:  # noqa: BLE001
@@ -146,6 +164,7 @@ class ReviewTab(QWidget):
         layout.addWidget(splitter, 1)
 
         self.canvas = MaskCanvas()
+        self.canvas.maskEdited.connect(self._on_mask_edited)
         splitter.addWidget(self.canvas)
 
         side = QWidget()
@@ -157,6 +176,7 @@ class ReviewTab(QWidget):
         side_layout.addWidget(animal_container)
 
         self.erase_checkbox = QCheckBox("Ластик (стирать кистью, а не рисовать)")
+        self.erase_checkbox.toggled.connect(self.canvas.set_erase_enabled)
         side_layout.addWidget(self.erase_checkbox)
 
         help_label = QLabel(
@@ -205,6 +225,7 @@ class ReviewTab(QWidget):
         self.warning_label.setText(review.warning or "")
         self.canvas.set_shot(review.display_image, review.masks)
         self._rebuild_animal_list(review)
+        self._refresh_accept_button_style()
 
     def _rebuild_animal_list(self, review: ShotReview) -> None:
         while self.animal_list.count():
@@ -243,6 +264,24 @@ class ReviewTab(QWidget):
 
     def _accept_all(self) -> None:
         self.canvas.accept_all()
+        self._rebuild_animal_list(self.reviews[self.current_index])
+        self._refresh_accept_button_style()
+
+    def _on_mask_edited(self) -> None:
+        self._rebuild_animal_list(self.reviews[self.current_index])
+        self._refresh_accept_button_style()
+
+    def _refresh_accept_button_style(self) -> None:
+        """Кнопка "Принять всё" горит зелёным, пока все непустые маски на этом фото
+        приняты; любая правка (кистью или перетаскиванием линии отреза) снимает
+        "принято" с изменённой маски (см. canvas.py), и кнопка гаснет сама собой."""
+        all_accepted = bool(self.reviews) and not self._has_unaccepted_nonempty_masks()
+        if all_accepted:
+            self.accept_btn.setStyleSheet(
+                "background-color: #2e7d32; color: white; font-weight: bold;"
+            )
+        else:
+            self.accept_btn.setStyleSheet("")
 
     def _recompute_current(self) -> None:
         if not self.reviews:
@@ -318,6 +357,11 @@ class ResultsTab(QWidget):
         self.mode_combo.currentIndexChanged.connect(self._refresh_table)
         top_row.addWidget(self.mode_combo)
 
+        top_row.addWidget(QLabel("Выдержка для сравнения:"))
+        self.exposure_combo = QComboBox()
+        self.exposure_combo.currentIndexChanged.connect(self._refresh_table)
+        top_row.addWidget(self.exposure_combo)
+
         self.average_checkbox = QCheckBox(
             "Показывать таблицу, усреднённую по животным (не влияет на статистику ниже — "
             "сравнение групп ВСЕГДА считается по животным, а не по отдельным срезам)"
@@ -331,6 +375,11 @@ class ResultsTab(QWidget):
         top_row.addWidget(export_csv_btn)
         layout.addLayout(top_row)
 
+        self.exposure_warning_label = QLabel("")
+        self.exposure_warning_label.setStyleSheet("color: #b34700; font-weight: bold;")
+        self.exposure_warning_label.setWordWrap(True)
+        layout.addWidget(self.exposure_warning_label)
+
         self.table_view = QTableView()
         self.table_view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         layout.addWidget(self.table_view, 2)
@@ -343,6 +392,13 @@ class ResultsTab(QWidget):
         self.metric_combo = QComboBox()
         self.metric_combo.addItems(["area_px (площадь)", "mean_intensity (средняя яркость)", "std_intensity (разброс яркости)"])
         controls_row.addWidget(self.metric_combo)
+
+        controls_row.addWidget(QLabel("Сравнивать по:"))
+        self.compare_by_combo = QComboBox()
+        self.compare_by_combo.addItem("Группе (как есть)", "group")
+        self.compare_by_combo.addItem("Контроль vs Опыт", "control")
+        self.compare_by_combo.addItem("Условию (все со всеми)", "condition")
+        controls_row.addWidget(self.compare_by_combo)
         compare_btn = QPushButton("Сравнить группы")
         compare_btn.clicked.connect(self._run_comparison)
         controls_row.addWidget(compare_btn)
@@ -392,6 +448,52 @@ class ResultsTab(QWidget):
             return df
         return df[df["mode"] == mode]
 
+    def _refresh_exposure_options(self) -> None:
+        """Заполняет список выдержек, ОБЩИХ для всех кадров текущего режима.
+
+        В папке группы обычно лежит несколько файлов с разной выдержкой на один и тот
+        же кадр (`Shot.exposure_files`); программа по умолчанию сама выбирает для
+        КАЖДОГО кадра свою "лучшую" (самую длинную незасвеченную). Для сравнения групп
+        по яркости это может быть некорректно, если у групп в итоге выбралась разная
+        выдержка — здесь можно явно зафиксировать одну выдержку на все группы сразу
+        (например, все "срезы" на 250мс, все "черепа" на 150мс).
+        """
+        mode = self._selected_mode()
+        relevant = [r for r in self.reviews if mode is None or r.shot.group.mode.value == mode]
+        exposure_sets = [set(r.shot.exposure_files.keys()) for r in relevant if r.shot.exposure_files]
+        common = sorted(set.intersection(*exposure_sets)) if exposure_sets else []
+
+        current = self.exposure_combo.currentData()
+        self.exposure_combo.blockSignals(True)
+        self.exposure_combo.clear()
+        self.exposure_combo.addItem("Авто (у каждого кадра своя)", None)
+        for exposure in common:
+            self.exposure_combo.addItem(f"{exposure} мс (общая для всех групп)", exposure)
+        idx = self.exposure_combo.findData(current)
+        self.exposure_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.exposure_combo.blockSignals(False)
+
+    def _mode_and_exposure_filtered(self) -> tuple[pd.DataFrame, list[str]]:
+        """Таблица по срезам для текущего режима, при необходимости пересчитанная на
+        одной зафиксированной выдержке. Возвращает (таблица, список кадров, у которых
+        нет файла с выбранной выдержкой и которые поэтому исключены)."""
+        exposure = self.exposure_combo.currentData()
+        if exposure is None:
+            return self._mode_filtered(self.slice_df), []
+
+        mode = self._selected_mode()
+        rows: list[MeasurementRow] = []
+        skipped: list[str] = []
+        for review in self.reviews:
+            if mode is not None and review.shot.group.mode.value != mode:
+                continue
+            if exposure not in review.shot.exposure_files:
+                skipped.append(review.shot.display_name)
+                continue
+            image = load_image(review.shot.exposure_files[exposure])
+            rows.extend(measure_shot(review, image=image, exposure_ms=exposure))
+        return rows_to_dataframe(rows), skipped
+
     def _refresh_table(self) -> None:
         all_rows: list[MeasurementRow] = []
         for review in self.reviews:
@@ -410,7 +512,12 @@ class ResultsTab(QWidget):
                 self.mode_combo.setCurrentIndex(idx)
         self.mode_combo.blockSignals(False)
 
-        filtered = self._mode_filtered(self.slice_df)
+        self._refresh_exposure_options()
+
+        filtered, skipped = self._mode_and_exposure_filtered()
+        self.exposure_warning_label.setText(
+            "Без выбранной выдержки исключены из сравнения: " + ", ".join(skipped) if skipped else ""
+        )
         if self.average_checkbox.isChecked():
             df = per_animal_average(filtered)
         else:
@@ -440,12 +547,30 @@ class ResultsTab(QWidget):
 
     def _animal_df(self) -> pd.DataFrame:
         """Таблица для статистики — ВСЕГДА агрегированная по животным (срез — не
-        независимое наблюдение) и ВСЕГДА только по выбранному режиму («что
-        анализируем») — иначе срезы и носовые части черепа могли бы сравниться вместе."""
-        return per_animal_average(self._mode_filtered(self.slice_df))
+        независимое наблюдение), только по выбранному режиму («что анализируем») —
+        иначе срезы и носовые части черепа могли бы сравниться вместе, и (если выбрана)
+        на одной зафиксированной выдержке для всех групп."""
+        filtered, _ = self._mode_and_exposure_filtered()
+        return per_animal_average(filtered)
+
+    def _comparison_df(self, animal_df: pd.DataFrame) -> pd.DataFrame:
+        """Подменяет колонку "group" на выбранное измерение сравнения ("Сравнивать
+        по"). compare_groups/save_boxplot всегда работают с колонкой "group" — так
+        сравнение "контроль vs опыт" или "по условию" не требует их менять, только
+        один раз здесь переименовать нужную колонку в "group"."""
+        key = self.compare_by_combo.currentData()
+        if key == "group" or animal_df.empty:
+            return animal_df
+        out = animal_df.copy()
+        if key == "control":
+            out["group"] = out["is_control"].map({True: "Контроль", False: "Опыт"})
+        elif key == "condition":
+            out = out[out["condition"].astype(str).str.strip() != ""]
+            out["group"] = out["condition"]
+        return out
 
     def _run_comparison(self) -> None:
-        animal_df = self._animal_df()
+        animal_df = self._comparison_df(self._animal_df())
         if animal_df.empty or animal_df["group"].nunique() < 2:
             QMessageBox.information(self, "Недостаточно данных", "Нужно минимум 2 группы с принятыми масками.")
             return
@@ -500,7 +625,7 @@ class ResultsTab(QWidget):
         self.stats_output.setPlainText("\n".join(lines))
 
     def _save_plot(self) -> None:
-        animal_df = self._animal_df()
+        animal_df = self._comparison_df(self._animal_df())
         if animal_df.empty:
             QMessageBox.information(self, "Пусто", "Сначала соберите таблицу.")
             return

@@ -9,8 +9,21 @@ import pandas as pd
 from .models import MeasurementRow, ShotReview
 
 
-def measure_shot(review: ShotReview) -> list[MeasurementRow]:
-    """Считает площадь/среднее/разброс только для масок, которые приняты пользователем."""
+def measure_shot(
+    review: ShotReview, image: np.ndarray | None = None, exposure_ms: int | None = None
+) -> list[MeasurementRow]:
+    """Считает площадь/среднее/разброс только для масок, которые приняты пользователем.
+
+    По умолчанию берёт `review.image` (кадр на автоматически выбранной выдержке) и
+    `review.shot.chosen_exposure`. Геометрия маски (какие пиксели относятся к
+    животному) от выдержки не зависит — это те же координаты на том же кадре, просто
+    снятом с другой длительностью экспозиции. Поэтому для сравнения групп на ОДНОЙ
+    и той же выдержке достаточно передать сюда изображение другого файла выдержки
+    того же кадра (`shot.exposure_files[нужная_выдержка]`) — маску пересчитывать не
+    нужно, площадь не изменится, а яркость посчитается корректно по нужному файлу.
+    """
+    image = review.image if image is None else image
+    exposure_ms = review.shot.chosen_exposure if exposure_ms is None else exposure_ms
     rows: list[MeasurementRow] = []
     for m in review.masks:
         if not m.accepted:
@@ -18,7 +31,7 @@ def measure_shot(review: ShotReview) -> list[MeasurementRow]:
         area = int(m.mask.sum())
         if area == 0:
             continue
-        values = review.image[m.mask].astype(np.float64)
+        values = image[m.mask].astype(np.float64)
         rows.append(
             MeasurementRow(
                 group=review.shot.group.name,
@@ -29,7 +42,9 @@ def measure_shot(review: ShotReview) -> list[MeasurementRow]:
                 std_intensity=float(values.std()),
                 source_file=review.shot.display_name,
                 mode=review.shot.group.mode.value,
-                exposure_ms=review.shot.chosen_exposure,
+                exposure_ms=exposure_ms,
+                is_control=review.shot.group.is_control,
+                condition=review.shot.group.condition,
             )
         )
     return rows
@@ -42,7 +57,7 @@ def rows_to_dataframe(rows: list[MeasurementRow]) -> pd.DataFrame:
             columns=[
                 "group", "animal_index", "slice_index", "area_px",
                 "mean_intensity", "std_intensity", "source_file",
-                "mode", "exposure_ms",
+                "mode", "exposure_ms", "is_control", "condition",
             ]
         )
     return df
@@ -95,6 +110,10 @@ def per_animal_average(df: pd.DataFrame) -> pd.DataFrame:
         row["mean_intensity"] = pooled_mean
         row["std_intensity"] = float(np.sqrt(max(pooled_var, 0.0)))
         row["exposure_ms"] = g["exposure_ms"].iloc[0]
+        # метка группы одна и та же для всех срезов/кадров одной группы — просто
+        # переносим, как и exposure_ms, без участия в ключе группировки
+        row["is_control"] = bool(g["is_control"].iloc[0])
+        row["condition"] = g["condition"].iloc[0]
         out_rows.append(row)
     return pd.DataFrame(out_rows)
 

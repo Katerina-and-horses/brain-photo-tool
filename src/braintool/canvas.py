@@ -31,6 +31,9 @@ class MaskCanvas(QWidget):
         self.active_key: tuple[int, int] | None = None
         self.brush_radius_img = 14.0
         self.erase_mode = False
+        # состояние чекбокса "Ластик" в боковой панели — независимо от кнопки мыши,
+        # чтобы можно было стирать левой кнопкой, не только правой
+        self._erase_toggle = False
 
         self._draw_rect: QRectF | None = None
         self._scale = 1.0
@@ -51,6 +54,9 @@ class MaskCanvas(QWidget):
     def set_active_mask(self, animal_index: int, slice_index: int) -> None:
         self.active_key = (animal_index, slice_index)
         self.update()
+
+    def set_erase_enabled(self, enabled: bool) -> None:
+        self._erase_toggle = bool(enabled)
 
     def accept_all(self) -> None:
         for m in self.masks:
@@ -170,7 +176,10 @@ class MaskCanvas(QWidget):
                     return
 
         self._dragging_brush = True
-        self.erase_mode = event.button() == Qt.MouseButton.RightButton
+        # правая кнопка стирает всегда; левая — стирает, только если включён чекбокс
+        # "Ластик" (раньше чекбокс ни на что не влиял — это и была жалоба "ластик не
+        # работает": включаешь чекбокс, жмёшь левой, а получаешь рисование)
+        self.erase_mode = self._erase_toggle or event.button() == Qt.MouseButton.RightButton
         self._paint_brush(img_pt)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
@@ -196,6 +205,10 @@ class MaskCanvas(QWidget):
                 # перетаскивании линии сторона выбора могла неожиданно инвертироваться
                 ref = m.rostral_anchor if m.rostral_anchor is not None else (0.0, 0.0)
                 m.mask = recompute_rostral_mask_from_line(m.source_blob, m.cut_line, ref)
+                # перетаскивание линии — тоже правка; раньше только кисть сбрасывала
+                # "принято", и перетащенная-но-непроверенная маска могла остаться
+                # помеченной как принятая
+                m.accepted = False
             self._dragging_handle = None
             self.maskEdited.emit()
             self.update()

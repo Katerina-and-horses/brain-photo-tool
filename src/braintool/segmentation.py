@@ -409,9 +409,22 @@ def compute_rostral_cut(
 
     perp_axis = np.array([-main_axis[1], main_axis[0]])
     center_at_cut = mean + main_axis * cut_proj_value
-    half_len = max(blob_mask.shape) * 0.35
-    p1 = tuple(center_at_cut + perp_axis * half_len)
-    p2 = tuple(center_at_cut - perp_axis * half_len)
+
+    # длина линии — от РЕАЛЬНОЙ ширины самого черепа (разброс его точек поперёк главной
+    # оси), а не от размера всего кадра. blob_mask — маска размера всего фото (см. Blob),
+    # и на фото с несколькими животными в ряд один череп занимает малую долю кадра —
+    # доля от полного кадра делала линию в разы длиннее черепа, и её концы улетали за
+    # границы фото (особенно у черепов ближе к краю). Небольшой запас (20%), чтобы
+    # ручки было удобно ухватить чуть за пределами самого пятна.
+    perp_proj = centered @ perp_axis
+    half_len = max((perp_proj.max() - perp_proj.min()) / 2 * 1.2, 10.0)
+    p1 = center_at_cut + perp_axis * half_len
+    p2 = center_at_cut - perp_axis * half_len
+
+    # подстраховка: даже с локальной длиной линия не должна выходить за пределы фото
+    img_h, img_w = blob_mask.shape
+    p1 = (float(np.clip(p1[0], 0, img_w - 1)), float(np.clip(p1[1], 0, img_h - 1)))
+    p2 = (float(np.clip(p2[0], 0, img_w - 1)), float(np.clip(p2[1], 0, img_h - 1)))
 
     return rostral_mask, (p1, p2)
 
