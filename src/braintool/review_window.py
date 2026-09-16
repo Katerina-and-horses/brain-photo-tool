@@ -2,6 +2,8 @@
 эпителий»), каждый — свой цикл из трёх вкладок: Проект, Проверка масок, Результаты."""
 from __future__ import annotations
 
+import html
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -20,12 +22,30 @@ from .imaging import choose_best_exposure, contrast_stretch_to_uint8, load_image
 from .measurements import export_table, measure_shot, per_animal_average, rows_to_dataframe
 from .models import GroupConfig, MaskMode, MeasurementRow, ShotReview
 from .segmentation import build_masks_for_image
-from .stats import compare_groups, save_boxplot
+from .stats import color_for_group, compare_groups, save_boxplot
 
 PIPELINE_TITLES = {
     MaskMode.WHOLE_BLOB: "Срезы",
     MaskMode.ROSTRAL_CUT: "Обонятельный эпителий",
 }
+
+_P_VALUE_RE = re.compile(r"(p(?:-value)?\s*[:=]\s*[0-9.]+)")
+
+
+def _format_stats_html(lines: list[str]) -> str:
+    """HTML-версия текстового вывода сравнения групп: жирным — p-value (чтобы не
+    искать глазами по строке), цветом предупреждения — уже принятым в программе
+    для похожих предупреждений (`exposure_warning_label`, `slice_warning_label`),
+    а не новым произвольным цветом."""
+    text = "\n".join(lines)
+    html_lines = []
+    for raw_line in text.split("\n"):
+        escaped = html.escape(raw_line)
+        escaped = _P_VALUE_RE.sub(r"<b>\1</b>", escaped)
+        if raw_line.strip().startswith("ВНИМАНИЕ"):
+            escaped = f'<span style="color:#b34700; font-weight:bold;">{escaped}</span>'
+        html_lines.append(escaped or "&nbsp;")
+    return "<br>".join(html_lines)
 
 
 class ProjectTab(QWidget):
@@ -391,6 +411,12 @@ class ResultsTab(QWidget):
         self.compare_by_combo.addItem("Контроль vs Опыт", "control")
         self.compare_by_combo.addItem("Условию (все со всеми)", "condition")
         controls_row.addWidget(self.compare_by_combo)
+
+        controls_row.addWidget(QLabel("Срез:"))
+        self.slice_combo = QComboBox()
+        self.slice_combo.addItem("Среднее по животному (все срезы)", None)
+        self.slice_combo.currentIndexChanged.connect(self._refresh_slice_warning)
+        controls_row.addWidget(self.slice_combo)
         compare_btn = QPushButton("Сравнить группы")
         compare_btn.clicked.connect(self._run_comparison)
         controls_row.addWidget(compare_btn)
@@ -409,6 +435,11 @@ class ResultsTab(QWidget):
         multi_metric_note.setWordWrap(True)
         multi_metric_note.setStyleSheet("color: #666666; font-style: italic;")
         stats_layout.addWidget(multi_metric_note)
+
+        self.slice_warning_label = QLabel("")
+        self.slice_warning_label.setStyleSheet("color: #b34700; font-weight: bold;")
+        self.slice_warning_label.setWordWrap(True)
+        stats_layout.addWidget(self.slice_warning_label)
 
         self.stats_output = QTextEdit()
         self.stats_output.setReadOnly(True)
@@ -472,6 +503,7 @@ class ResultsTab(QWidget):
         self.slice_df = rows_to_dataframe(all_rows)
 
         self._refresh_exposure_options()
+        self._refresh_slice_options()
 
         filtered, skipped = self._exposure_filtered()
         self.exposure_warning_label.setText(
@@ -483,13 +515,79 @@ class ResultsTab(QWidget):
             df = filtered
         self.current_df = df
         self._show_dataframe(df)
+        self._refresh_slice_warning()
+
+    def _refresh_slice_options(self) -> None:
+        """Заполняет список конкретных номеров среза, реально найденных в текущих
+        измерениях — для сравнения "по срезу №N" вместо "среднее по животному"
+        (номера появляются/исчезают по мере разметки, поэтому список строится
+        динамически, а не фиксированным набором)."""
+        values: list[int] = []
+        if not self.slice_df.empty and "slice_index" in self.slice_df.columns:
+            values = sorted(int(v) for v in self.slice_df["slice_index"].dropna().unique())
+
+        current = self.slice_combo.currentData()
+        self.slice_combo.blockSignals(True)
+        self.slice_combo.clear()
+        self.slice_combo.addItem("Среднее по животному (все срезы)", None)
+        for slice_index in values:
+            self.slice_combo.addItem(f"Только срез №{slice_index}", slice_index)
+        idx = self.slice_combo.findData(current)
+        self.slice_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.slice_combo.blockSignals(False)
+
+    def _slice_filter_info(self) -> tuple[pd.DataFrame, int]:
+        """Таблица по срезам (уже отфильтрованная по выдержке), при необходимости
+        суженная до одного выбранного номера среза. Возвращает (таблица, число
+        животных, у которых при этом выборе среза не осталось ни одной строки —
+        то есть молча исключённых из сравнения)."""
+        filtered, _ = self._exposure_filtered()
+        slice_index = self.slice_combo.currentData()
+        if slice_index is None or filtered.empty:
+            return filtered, 0
+        animal_cols = ["group", "mode", "source_file", "animal_index"]
+        total = filtered[animal_cols].drop_duplicates().shape[0]
+        sliced = filtered[filtered["slice_index"] == slice_index]
+        kept = sliced[animal_cols].drop_duplicates().shape[0]
+        return sliced, total - kept
+
+    def _refresh_slice_warning(self) -> None:
+        slice_index = self.slice_combo.currentData()
+        if slice_index is None:
+            self.slice_warning_label.setText("")
+            return
+        _, dropped = self._slice_filter_info()
+        if dropped:
+            self.slice_warning_label.setText(
+                f"Срез №{slice_index}: исключено из сравнения животных без этого среза — {dropped}."
+            )
+        else:
+            self.slice_warning_label.setText(
+                f"Срез №{slice_index}: у всех животных есть этот срез, никто не исключён."
+            )
 
     def _show_dataframe(self, df: pd.DataFrame) -> None:
+        # визуально группируем строки по группе — раньше порядок был "как пришло",
+        # из-за чего строки одной группы могли перемежаться со строками другой
+        if "group" in df.columns and not df.empty:
+            sort_cols = [c for c in ("group", "animal_index", "slice_index") if c in df.columns]
+            df = df.sort_values(sort_cols, kind="stable").reset_index(drop=True)
+
         model = QStandardItemModel(df.shape[0], df.shape[1])
         model.setHorizontalHeaderLabels(list(df.columns))
+        group_colors: dict[str, QColor] = {}
+        if "group" in df.columns:
+            for i, g in enumerate(sorted(df["group"].unique())):
+                color = QColor(color_for_group(i))
+                color.setAlpha(45)
+                group_colors[g] = color
         for r in range(df.shape[0]):
+            row_color = group_colors.get(df.iat[r, df.columns.get_loc("group")]) if group_colors else None
             for c, col in enumerate(df.columns):
-                model.setItem(r, c, QStandardItem(str(df.iat[r, c])))
+                item = QStandardItem(str(df.iat[r, c]))
+                if row_color is not None:
+                    item.setBackground(row_color)
+                model.setItem(r, c, item)
         self.table_view.setModel(model)
 
     def _export_table(self) -> None:
@@ -506,9 +604,17 @@ class ResultsTab(QWidget):
 
     def _animal_df(self) -> pd.DataFrame:
         """Таблица для статистики — ВСЕГДА агрегированная по животным (срез — не
-        независимое наблюдение), и (если выбрана) на одной зафиксированной выдержке
-        для всех групп."""
-        filtered, _ = self._exposure_filtered()
+        независимое наблюдение), и (если выбрано) на одной зафиксированной выдержке
+        и/или одном конкретном номере среза для всех групп.
+
+        Если выбран конкретный срез №N, `per_animal_average` получает уже суженную
+        до этого среза таблицу — животных с несколькими срезами это не меняет
+        (после сужения на животное остаётся ровно один срез, "усреднение" по нему
+        тривиально), а животных БЕЗ среза №N молча исключает — количество таких
+        животных показывается отдельно в `slice_warning_label`/`_run_comparison`,
+        не молча.
+        """
+        filtered, _ = self._slice_filter_info()
         return per_animal_average(filtered)
 
     def _comparison_df(self, animal_df: pd.DataFrame) -> pd.DataFrame:
@@ -539,11 +645,23 @@ class ResultsTab(QWidget):
             QMessageBox.warning(self, "Не удалось сравнить", str(exc))
             return
 
+        slice_index = self.slice_combo.currentData()
+        unit_note = (
+            "единица анализа — животное, срезы усреднены" if slice_index is None
+            else f"единица анализа — животное, только срез №{slice_index}"
+        )
         lines = [
-            f"Метод: {result.test_name} (единица анализа — животное, срезы усреднены)",
+            f"Метод: {result.test_name} ({unit_note})",
             f"Группы: {', '.join(f'{g} (n={result.n_per_group[g]})' for g in result.groups)}",
             f"Общий p-value: {result.p_value:.4f}" + ("  (есть значимое различие, p < 0.05)" if result.p_value < 0.05 else "  (значимого различия не обнаружено)"),
         ]
+        if slice_index is not None:
+            _, dropped = self._slice_filter_info()
+            if dropped:
+                lines.append(
+                    f"\nВНИМАНИЕ: при выборе среза №{slice_index} исключено животных без "
+                    f"этого среза — {dropped}. Результат относится только к оставшимся."
+                )
 
         if metric in ("mean_intensity", "std_intensity") and "exposure_ms" in animal_df.columns:
             compared = animal_df[animal_df["group"].isin(result.groups)]
@@ -580,7 +698,7 @@ class ResultsTab(QWidget):
         else:
             pw = result.pairwise[0]
             lines.append(f"Размер эффекта (ранговая бисериальная корреляция): {pw.effect_size:+.2f}")
-        self.stats_output.setPlainText("\n".join(lines))
+        self.stats_output.setHtml(_format_stats_html(lines))
 
     def _save_plot(self) -> None:
         animal_df = self._comparison_df(self._animal_df())
@@ -591,7 +709,9 @@ class ResultsTab(QWidget):
         path, _ = QFileDialog.getSaveFileName(self, "Сохранить график", "сравнение_групп.png", "PNG (*.png)")
         if not path:
             return
-        save_boxplot(animal_df, metric, Path(path), title=self.metric_combo.currentText() + " (по животным)")
+        slice_index = self.slice_combo.currentData()
+        suffix = " (по животным)" if slice_index is None else f" (срез №{slice_index})"
+        save_boxplot(animal_df, metric, Path(path), title=self.metric_combo.currentText() + suffix)
         QMessageBox.information(self, "Готово", f"График сохранён:\n{path}")
 
 

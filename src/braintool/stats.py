@@ -12,6 +12,30 @@ import pandas as pd
 
 from . import nonparametric
 
+# Категориальная палитра (см. навык dataviz проекта) — фиксированный порядок
+# оттенков, провалидированный на различимость при дальтонизме; не переставлять и
+# не выбирать цвета "на глаз". Используется и для графика, и (в review_window.py)
+# для подсветки строк таблицы результатов по группе — один и тот же цвет группы
+# в обоих местах.
+CATEGORICAL_PALETTE: list[str] = [
+    "#2a78d6",  # blue
+    "#eb6834",  # orange
+    "#1baf7a",  # aqua
+    "#eda100",  # yellow
+    "#e87ba4",  # magenta
+    "#008300",  # green
+    "#4a3aa7",  # violet
+    "#e34948",  # red
+]
+
+
+def color_for_group(index: int) -> str:
+    """Цвет для группы по её порядковому номеру (0-based) в отсортированном списке
+    групп. Больше 8 групп палитра не покрывает — тогда цвета неизбежно повторяются
+    (сознательный компромисс для внутреннего лабораторного инструмента, а не общий
+    рецепт: см. dataviz — "9-я серия не генерируется, а уходит в 'Другое'/фасетку")."""
+    return CATEGORICAL_PALETTE[index % len(CATEGORICAL_PALETTE)]
+
 
 @dataclass
 class PairwiseResult:
@@ -92,13 +116,31 @@ def compare_groups(df: pd.DataFrame, metric: str) -> ComparisonResult:
 def save_boxplot(df: pd.DataFrame, metric: str, out_path: Path, title: str | None = None) -> None:
     groups = sorted(df["group"].unique())
     data = [df.loc[df["group"] == g, metric].dropna().to_numpy() for g in groups]
+    colors = [color_for_group(i) for i in range(len(groups))]
+    # n прямо в подписи оси — жалоба была не на отсутствие данных (они и так шли в
+    # compare_groups), а на то, что размер выборки не виден на самом графике
+    tick_labels = [f"{g}\n(n={len(d)})" for g, d in zip(groups, data)]
 
     fig, ax = plt.subplots(figsize=(max(4, 1.2 * len(groups) + 2), 5))
-    ax.boxplot(data, tick_labels=groups, showmeans=True)
-    for i, d in enumerate(data, start=1):
-        ax.scatter([i] * len(d), d, alpha=0.6, s=20, color="#555555")
+    ax.set_facecolor("#fcfcfb")
+    fig.patch.set_facecolor("#fcfcfb")
+    bp = ax.boxplot(data, tick_labels=tick_labels, showmeans=True, patch_artist=True)
+    for patch, color in zip(bp["boxes"], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.35)
+        patch.set_edgecolor(color)
+    for median in bp["medians"]:
+        median.set_color("#0b0b0b")
+    # цвет точек = цвет группы (та же палитра, что и подсветка строк таблицы
+    # результатов в review_window.py) — группа узнаётся по цвету в обоих местах
+    for i, (d, color) in enumerate(zip(data, colors), start=1):
+        ax.scatter([i] * len(d), d, alpha=0.85, s=24, color=color,
+                    edgecolor="#0b0b0b", linewidth=0.4, zorder=3)
     ax.set_ylabel(metric)
     ax.set_title(title or metric)
+    ax.tick_params(colors="#52514e")
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
+    fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor())
     plt.close(fig)
