@@ -1,4 +1,5 @@
-"""Главное окно программы: три вкладки — Проект, Проверка масок, Результаты."""
+"""Главное окно программы: два независимых пайплайна («Срезы» и «Обонятельный
+эпителий»), каждый — свой цикл из трёх вкладок: Проект, Проверка масок, Результаты."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -21,25 +22,25 @@ from .models import GroupConfig, MaskMode, MeasurementRow, ShotReview
 from .segmentation import build_masks_for_image
 from .stats import compare_groups, save_boxplot
 
-MODE_LABELS = {
-    MaskMode.WHOLE_BLOB: "Весь срез целиком",
-    MaskMode.ROSTRAL_CUT: "Носовая (передняя) часть черепа",
+PIPELINE_TITLES = {
+    MaskMode.WHOLE_BLOB: "Срезы",
+    MaskMode.ROSTRAL_CUT: "Обонятельный эпителий",
 }
-MODE_BY_LABEL = {v: k for k, v in MODE_LABELS.items()}
 
 
 class ProjectTab(QWidget):
-    """Вкладка настройки групп: какие папки, какая сетка, какой режим обводки."""
+    """Вкладка настройки групп: какие папки, какая сетка — для ОДНОГО пайплайна
+    (что обводить зафиксировано пайплайном, а не выбирается по группе)."""
 
-    def __init__(self, on_start_review):
+    def __init__(self, mode: MaskMode, on_start_review):
         super().__init__()
+        self.mode = mode
         self._on_start_review = on_start_review
         self.groups: list[GroupConfig] = []
 
         layout = QVBoxLayout(self)
         info = QLabel(
             "Добавьте по одной папке на каждую группу животных. Для каждой папки укажите:\n"
-            "— что обводить (весь срез мозга или носовую часть черепа сверху);\n"
             "— сколько животных на одном фото (по горизонтали, слева направо);\n"
             "— контрольная это группа или опытная (для сравнения «контроль vs опыт»);\n"
             "— при желании — произвольное условие (например, дата съёмки), чтобы потом "
@@ -49,9 +50,9 @@ class ProjectTab(QWidget):
         info.setWordWrap(True)
         layout.addWidget(info)
 
-        self.table = QTableWidget(0, 6)
+        self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(
-            ["Группа", "Папка", "Что обводить", "Животных в ряд", "Контроль?", "Условие (метка)"]
+            ["Группа", "Папка", "Животных в ряд", "Контроль?", "Условие (метка)"]
         )
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setVisible(False)
@@ -85,14 +86,10 @@ class ProjectTab(QWidget):
         self.table.setItem(row, 0, QTableWidgetItem(name.strip()))
         self.table.setItem(row, 1, QTableWidgetItem(folder))
 
-        mode_combo = QComboBox()
-        mode_combo.addItems(list(MODE_LABELS.values()))
-        self.table.setCellWidget(row, 2, mode_combo)
-
         cols_spin = QSpinBox()
         cols_spin.setRange(1, 200)
         cols_spin.setValue(5)  # в лаборатории в группе обычно 5 животных
-        self.table.setCellWidget(row, 3, cols_spin)
+        self.table.setCellWidget(row, 2, cols_spin)
 
         control_checkbox = QCheckBox()
         control_cell = QWidget()
@@ -100,9 +97,9 @@ class ProjectTab(QWidget):
         control_layout.addWidget(control_checkbox)
         control_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         control_layout.setContentsMargins(0, 0, 0, 0)
-        self.table.setCellWidget(row, 4, control_cell)
+        self.table.setCellWidget(row, 3, control_cell)
 
-        self.table.setItem(row, 5, QTableWidgetItem(""))
+        self.table.setItem(row, 4, QTableWidgetItem(""))
 
     def _remove_selected(self) -> None:
         rows = sorted({idx.row() for idx in self.table.selectedIndexes()}, reverse=True)
@@ -114,15 +111,14 @@ class ProjectTab(QWidget):
         for row in range(self.table.rowCount()):
             name = self.table.item(row, 0).text()
             folder = self.table.item(row, 1).text()
-            mode_label = self.table.cellWidget(row, 2).currentText()
-            cols = self.table.cellWidget(row, 3).value()
-            is_control = self.table.cellWidget(row, 4).findChild(QCheckBox).isChecked()
-            condition_item = self.table.item(row, 5)
+            cols = self.table.cellWidget(row, 2).value()
+            is_control = self.table.cellWidget(row, 3).findChild(QCheckBox).isChecked()
+            condition_item = self.table.item(row, 4)
             condition = condition_item.text().strip() if condition_item else ""
             try:
                 groups.append(
                     GroupConfig(
-                        name=name, folder=Path(folder), mode=MODE_BY_LABEL[mode_label],
+                        name=name, folder=Path(folder), mode=self.mode,
                         cols=cols, is_control=is_control, condition=condition,
                     )
                 )
@@ -337,7 +333,8 @@ class ReviewTab(QWidget):
 
 
 class ResultsTab(QWidget):
-    """Вкладка итоговой таблицы, экспорта и сравнения групп."""
+    """Вкладка итоговой таблицы, экспорта и сравнения групп — для ОДНОГО пайплайна
+    (что анализируем зафиксировано пайплайном, фильтр по режиму не нужен)."""
 
     def __init__(self):
         super().__init__()
@@ -351,11 +348,6 @@ class ResultsTab(QWidget):
         refresh_btn = QPushButton("Собрать таблицу по принятым маскам")
         refresh_btn.clicked.connect(self._refresh_table)
         top_row.addWidget(refresh_btn)
-
-        top_row.addWidget(QLabel("Что анализируем:"))
-        self.mode_combo = QComboBox()
-        self.mode_combo.currentIndexChanged.connect(self._refresh_table)
-        top_row.addWidget(self.mode_combo)
 
         top_row.addWidget(QLabel("Выдержка для сравнения:"))
         self.exposure_combo = QComboBox()
@@ -432,24 +424,8 @@ class ResultsTab(QWidget):
     def _current_metric_key(self) -> str:
         return self.metric_combo.currentText().split(" ")[0]
 
-    def _selected_mode(self) -> str | None:
-        return self.mode_combo.currentData()
-
-    def _mode_filtered(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Оставляет только строки выбранного режима («что обводили»).
-
-        Срез мозга и носовая часть черепа — принципиально разные измерения, даже если
-        пользователь назвал обе группы одинаково (например, добавил и папку «череп и
-        мозг», и папку «срезы» одного животного под одним и тем же именем группы). Без
-        этого фильтра они бы молча усреднились/сравнились вместе, что бессмысленно.
-        """
-        mode = self._selected_mode()
-        if mode is None or df.empty or "mode" not in df.columns:
-            return df
-        return df[df["mode"] == mode]
-
     def _refresh_exposure_options(self) -> None:
-        """Заполняет список выдержек, ОБЩИХ для всех кадров текущего режима.
+        """Заполняет список выдержек, ОБЩИХ для всех кадров этого пайплайна.
 
         В папке группы обычно лежит несколько файлов с разной выдержкой на один и тот
         же кадр (`Shot.exposure_files`); программа по умолчанию сама выбирает для
@@ -458,9 +434,7 @@ class ResultsTab(QWidget):
         выдержка — здесь можно явно зафиксировать одну выдержку на все группы сразу
         (например, все "срезы" на 250мс, все "черепа" на 150мс).
         """
-        mode = self._selected_mode()
-        relevant = [r for r in self.reviews if mode is None or r.shot.group.mode.value == mode]
-        exposure_sets = [set(r.shot.exposure_files.keys()) for r in relevant if r.shot.exposure_files]
+        exposure_sets = [set(r.shot.exposure_files.keys()) for r in self.reviews if r.shot.exposure_files]
         common = sorted(set.intersection(*exposure_sets)) if exposure_sets else []
 
         current = self.exposure_combo.currentData()
@@ -473,20 +447,17 @@ class ResultsTab(QWidget):
         self.exposure_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.exposure_combo.blockSignals(False)
 
-    def _mode_and_exposure_filtered(self) -> tuple[pd.DataFrame, list[str]]:
-        """Таблица по срезам для текущего режима, при необходимости пересчитанная на
-        одной зафиксированной выдержке. Возвращает (таблица, список кадров, у которых
-        нет файла с выбранной выдержкой и которые поэтому исключены)."""
+    def _exposure_filtered(self) -> tuple[pd.DataFrame, list[str]]:
+        """Таблица по срезам, при необходимости пересчитанная на одной зафиксированной
+        выдержке. Возвращает (таблица, список кадров, у которых нет файла с выбранной
+        выдержкой и которые поэтому исключены)."""
         exposure = self.exposure_combo.currentData()
         if exposure is None:
-            return self._mode_filtered(self.slice_df), []
+            return self.slice_df, []
 
-        mode = self._selected_mode()
         rows: list[MeasurementRow] = []
         skipped: list[str] = []
         for review in self.reviews:
-            if mode is not None and review.shot.group.mode.value != mode:
-                continue
             if exposure not in review.shot.exposure_files:
                 skipped.append(review.shot.display_name)
                 continue
@@ -500,21 +471,9 @@ class ResultsTab(QWidget):
             all_rows.extend(measure_shot(review))
         self.slice_df = rows_to_dataframe(all_rows)
 
-        present_modes = [m for m in self.slice_df.get("mode", pd.Series(dtype=str)).unique() if m]
-        current = self.mode_combo.currentData()
-        self.mode_combo.blockSignals(True)
-        self.mode_combo.clear()
-        for m in sorted(present_modes):
-            self.mode_combo.addItem(MODE_LABELS.get(MaskMode(m), m), m)
-        if current is not None:
-            idx = self.mode_combo.findData(current)
-            if idx >= 0:
-                self.mode_combo.setCurrentIndex(idx)
-        self.mode_combo.blockSignals(False)
-
         self._refresh_exposure_options()
 
-        filtered, skipped = self._mode_and_exposure_filtered()
+        filtered, skipped = self._exposure_filtered()
         self.exposure_warning_label.setText(
             "Без выбранной выдержки исключены из сравнения: " + ", ".join(skipped) if skipped else ""
         )
@@ -547,10 +506,9 @@ class ResultsTab(QWidget):
 
     def _animal_df(self) -> pd.DataFrame:
         """Таблица для статистики — ВСЕГДА агрегированная по животным (срез — не
-        независимое наблюдение), только по выбранному режиму («что анализируем») —
-        иначе срезы и носовые части черепа могли бы сравниться вместе, и (если выбрана)
-        на одной зафиксированной выдержке для всех групп."""
-        filtered, _ = self._mode_and_exposure_filtered()
+        независимое наблюдение), и (если выбрана) на одной зафиксированной выдержке
+        для всех групп."""
+        filtered, _ = self._exposure_filtered()
         return per_animal_average(filtered)
 
     def _comparison_df(self, animal_df: pd.DataFrame) -> pd.DataFrame:
@@ -637,13 +595,15 @@ class ResultsTab(QWidget):
         QMessageBox.information(self, "Готово", f"График сохранён:\n{path}")
 
 
-class MainWindow(QTabWidget):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Обработка фото мозга")
-        self.resize(1280, 820)
+class PipelineTabs(QTabWidget):
+    """Один независимый цикл Проект → Проверка масок → Результаты для одного
+    пайплайна (режим обводки зафиксирован на весь пайплайн)."""
 
-        self.project_tab = ProjectTab(on_start_review=self._start_review)
+    def __init__(self, mode: MaskMode):
+        super().__init__()
+        self.mode = mode
+
+        self.project_tab = ProjectTab(mode=mode, on_start_review=self._start_review)
         self.review_tab = ReviewTab(on_all_reviewed=self._finish_review)
         self.results_tab = ResultsTab()
 
@@ -685,3 +645,17 @@ class MainWindow(QTabWidget):
         self.results_tab.set_reviews(reviews)
         self.setTabEnabled(2, True)
         self.setCurrentIndex(2)
+
+
+class MainWindow(QTabWidget):
+    """Верхний уровень: выбор пайплайна («Срезы» / «Обонятельный эпителий») —
+    каждый со своим полностью независимым циклом Проект→Проверка→Результаты
+    и своим списком групп/фото, без общего хранилища между пайплайнами."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Обработка фото мозга")
+        self.resize(1280, 820)
+
+        for mode, title in PIPELINE_TITLES.items():
+            self.addTab(PipelineTabs(mode), title)
