@@ -12,11 +12,14 @@ from .segmentation import mask_to_polygon, polygon_to_mask, recompute_rostral_ma
 
 HANDLE_HIT_RADIUS_PX = 14  # в экранных пикселях — попадание по вершине (клик/тяга)
 EDGE_HIT_RADIUS_PX = 10    # попадание по ребру полигона (двойной клик — добавить точку)
+MIN_ZOOM = 1.0             # 1.0 = фото вписано целиком (как раньше, до зума)
+MAX_ZOOM = 8.0
 
 
 class MaskCanvas(QWidget):
-    """Показывает фото с полупрозрачными масками; поддерживает кисть и перетаскивание
-    линии отреза для режима "носовая часть черепа"."""
+    """Показывает фото с полупрозрачными масками; поддерживает кисть, перетаскивание
+    линии отреза (режим "носовая часть черепа") и правку контура точками, плюс зум/
+    панораму для рассмотрения деталей вблизи."""
 
     maskEdited = Signal()
 
@@ -37,11 +40,16 @@ class MaskCanvas(QWidget):
         self._erase_toggle = False
         # состояние чекбокса "Режим точек" — альтернатива кисти: маска редактируется
         # перетаскиванием вершин полигона, а не закрашиванием. Пока включён, кисть
-        # не рисует (мышь целиком уходит на работу с точками активной маски).
+        # не рисует (мышь целиком уходит на работу с точками).
         self._point_mode_enabled = False
 
         self._draw_rect: QRectF | None = None
         self._scale = 1.0
+        self._zoom = 1.0
+        self._pan_offset = QPointF(0.0, 0.0)  # экранные пиксели, поверх центрирования
+        self._panning = False
+        self._pan_last_screen: QPointF | None = None
+
         self._dragging_handle: tuple[SpecimenMask, int] | None = None
         self._dragging_polygon_vertex: tuple[SpecimenMask, int] | None = None
         self._dragging_brush = False
@@ -55,14 +63,15 @@ class MaskCanvas(QWidget):
             self.active_key = (masks[0].animal_index, masks[0].slice_index)
         else:
             self.active_key = None
+        # новое фото — старый зум/пан почти наверняка не туда указывает
+        self._zoom = 1.0
+        self._pan_offset = QPointF(0.0, 0.0)
+        if self._point_mode_enabled:
+            self._ensure_all_polygons()
         self.update()
 
     def set_active_mask(self, animal_index: int, slice_index: int) -> None:
         self.active_key = (animal_index, slice_index)
-        if self._point_mode_enabled:
-            active = self._active_mask()
-            if active is not None:
-                self._ensure_polygon(active)
         self.update()
 
     def set_erase_enabled(self, enabled: bool) -> None:
@@ -71,9 +80,7 @@ class MaskCanvas(QWidget):
     def set_point_mode_enabled(self, enabled: bool) -> None:
         self._point_mode_enabled = bool(enabled)
         if self._point_mode_enabled:
-            active = self._active_mask()
-            if active is not None:
-                self._ensure_polygon(active)
+            self._ensure_all_polygons()
         self.update()
 
     def _ensure_polygon(self, m: SpecimenMask) -> None:
@@ -84,6 +91,14 @@ class MaskCanvas(QWidget):
         или предварительная правка кистью)."""
         if m.polygon is None and m.mask.any():
             m.polygon = mask_to_polygon(m.mask)
+
+    def _ensure_all_polygons(self) -> None:
+        """Полигоны нужны у ВСЕХ масок сразу (не только активной) — иначе при
+        нескольких животных/срезах на фото пришлось бы щёлкать по каждому в списке
+        слева, чтобы просто увидеть его контур; переключение между ними в списке
+        неудобно и легко пропустить, кого не проверил."""
+        for m in self.masks:
+            self._ensure_polygon(m)
 
     def accept_all(self) -> None:
         for m in self.masks:
@@ -106,11 +121,12 @@ class MaskCanvas(QWidget):
             return
         ih, iw = self.image_u8.shape[:2]
         aw, ah = max(1, self.width()), max(1, self.height())
-        scale = min(aw / iw, ah / ih)
-        dw, dh = iw * scale, ih * scale
-        x0, y0 = (aw - dw) / 2, (ah - dh) / 2
+        base_scale = min(aw / iw, ah / ih)
+        self._scale = base_scale * self._zoom
+        dw, dh = iw * self._scale, ih * self._scale
+        x0 = (aw - dw) / 2 + self._pan_offset.x()
+        y0 = (ah - dh) / 2 + self._pan_offset.y()
         self._draw_rect = QRectF(x0, y0, dw, dh)
-        self._scale = scale
 
     def _screen_to_image(self, pt: QPointF) -> tuple[float, float] | None:
         if self._draw_rect is None or self._scale == 0:
@@ -120,6 +136,12 @@ class MaskCanvas(QWidget):
         ix = (pt.x() - self._draw_rect.x()) / self._scale
         iy = (pt.y() - self._draw_rect.y()) / self._scale
         return ix, iy
+
+    def _to_screen(self, p: tuple[float, float]) -> QPointF:
+        return QPointF(
+            self._draw_rect.x() + p[0] * self._scale,
+            self._draw_rect.y() + p[1] * self._scale,
+        )
 
     # ---------- отрисовка ----------
 
@@ -145,13 +167,15 @@ class MaskCanvas(QWidget):
             if m.cut_line is not None:
                 self._draw_handles(painter, m, is_active=(m is active))
 
-        # полигон точек показываем ТОЛЬКО у активной маски (в отличие от линии
-        # отреза выше) — упрощение для первой версии, см. известные ограничения
-        # в документации
-        if self._point_mode_enabled and active is not None:
-            self._ensure_polygon(active)
-            if active.polygon:
-                self._draw_polygon_handles(painter, active.polygon)
+        # полигон точек — по той же логике, что и линия отреза выше: ВСЕ маски сразу,
+        # активная ярче. Раньше показывалась только активная — оказалось неудобно
+        # переключаться между животными/срезами в списке слева, чтобы просто увидеть
+        # контур и понять, норм он или нет
+        if self._point_mode_enabled:
+            self._ensure_all_polygons()
+            for m in self.masks:
+                if m.polygon:
+                    self._draw_polygon(painter, m.polygon, is_active=(m is active))
 
         painter.end()
 
@@ -188,49 +212,53 @@ class MaskCanvas(QWidget):
         painter.setPen(QPen(QColor(255, 255, 255, line_alpha), line_width, Qt.PenStyle.DashLine))
         painter.drawLine(QPointF(sx1, sy1), QPointF(sx2, sy2))
 
-    def _to_screen(self, p: tuple[float, float]) -> QPointF:
-        return QPointF(
-            self._draw_rect.x() + p[0] * self._scale,
-            self._draw_rect.y() + p[1] * self._scale,
-        )
+    def _draw_polygon(self, painter: QPainter, polygon: list[tuple[float, float]], is_active: bool) -> None:
+        line_alpha = 230 if is_active else 110
+        line_width = 2 if is_active else 1
+        handle_radius = 5 if is_active else 3
 
-    def _draw_polygon_handles(self, painter: QPainter, polygon: list[tuple[float, float]]) -> None:
         screen_pts = [self._to_screen(p) for p in polygon]
-        painter.setPen(QPen(QColor(255, 255, 255, 230), 2))
+        painter.setPen(QPen(QColor(255, 255, 255, line_alpha), line_width))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         for i in range(len(screen_pts)):
             painter.drawLine(screen_pts[i], screen_pts[(i + 1) % len(screen_pts)])
-        painter.setBrush(QBrush(QColor(255, 255, 255, 230)))
+        painter.setBrush(QBrush(QColor(255, 255, 255, line_alpha)))
         for sp in screen_pts:
-            painter.drawEllipse(sp, 5, 5)
+            painter.drawEllipse(sp, handle_radius, handle_radius)
 
     # ---------- взаимодействие мышью ----------
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._panning = True
+            self._pan_last_screen = event.position()
+            return
+
         img_pt = self._screen_to_image(event.position())
         if img_pt is None:
             return
 
         # режим точек полностью забирает мышь себе — кисть в этом режиме не рисует
-        # (переключение между режимами — отдельный чекбокс в боковой панели)
+        # (переключение между режимами — отдельный чекбокс в боковой панели). Ищем
+        # среди ВСЕХ масок сразу (как и с cut_line ниже) — так можно поправить любое
+        # животное прямо на фото, не переключаясь сначала на него в списке слева;
+        # попадание заодно переключает активное животное
         if self._point_mode_enabled:
-            active = self._active_mask()
-            if active is not None:
-                self._ensure_polygon(active)
-                if active.polygon:
-                    idx = self._hit_test_polygon_vertex(active.polygon, img_pt)
-                    if idx is not None:
-                        if event.button() == Qt.MouseButton.RightButton:
-                            if len(active.polygon) > 3:
-                                del active.polygon[idx]
-                                active.mask = polygon_to_mask(active.polygon, active.mask.shape)
-                                active.accepted = False
-                                self.maskEdited.emit()
-                                self.update()
-                            return
-                        self._dragging_polygon_vertex = (active, idx)
-                        self.update()
-                        return
+            hit = self._hit_test_polygon_vertex_any(img_pt)
+            if hit is not None:
+                m, idx = hit
+                self.active_key = (m.animal_index, m.slice_index)
+                if event.button() == Qt.MouseButton.RightButton:
+                    if len(m.polygon) > 3:
+                        del m.polygon[idx]
+                        m.mask = polygon_to_mask(m.polygon, m.mask.shape)
+                        m.accepted = False
+                        self.maskEdited.emit()
+                    self.update()
+                    return
+                self._dragging_polygon_vertex = (m, idx)
+                self.update()
+                return
             # клик мимо вершины в режиме точек ничего не делает — добавление точки
             # только двойным кликом на ребре (mouseDoubleClickEvent), одиночный клик
             # по пустому месту не должен случайно создавать новую точку
@@ -259,6 +287,13 @@ class MaskCanvas(QWidget):
         self._paint_brush(img_pt)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._panning and self._pan_last_screen is not None:
+            delta = event.position() - self._pan_last_screen
+            self._pan_offset += delta
+            self._pan_last_screen = event.position()
+            self.update()
+            return
+
         img_pt = self._screen_to_image(event.position())
         if img_pt is None:
             return
@@ -283,6 +318,10 @@ class MaskCanvas(QWidget):
             self._paint_brush(img_pt)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._panning = False
+            self._pan_last_screen = None
+            return
         if self._dragging_polygon_vertex is not None:
             m, _ = self._dragging_polygon_vertex
             m.mask = polygon_to_mask(m.polygon, m.mask.shape)
@@ -310,61 +349,87 @@ class MaskCanvas(QWidget):
             self.maskEdited.emit()
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
-        """Двойной клик на ребре полигона (только в режиме точек) — добавляет
-        вершину в этом месте. Одиночный клик рядом с ребром намеренно ничего не
-        делает (см. mousePressEvent) — иначе случайная новая точка при попытке
-        просто перетащить существующую была бы неотличима от намеренного добавления."""
+        """Двойной клик на ребре полигона (только в режиме точек, у любой маски) —
+        добавляет вершину в этом месте. Одиночный клик рядом с ребром намеренно
+        ничего не делает (см. mousePressEvent) — иначе случайная новая точка при
+        попытке просто перетащить существующую была бы неотличима от намеренного
+        добавления."""
         if not self._point_mode_enabled:
             return
         img_pt = self._screen_to_image(event.position())
         if img_pt is None:
             return
-        active = self._active_mask()
-        if active is None or not active.polygon:
+        hit = self._hit_test_polygon_edge_any(img_pt)
+        if hit is None:
             return
-        insert_at = self._hit_test_polygon_edge(active.polygon, img_pt)
-        if insert_at is None:
-            return
-        polygon = list(active.polygon)
+        m, insert_at = hit
+        polygon = list(m.polygon)
         polygon.insert(insert_at, img_pt)
-        active.polygon = polygon
-        active.mask = polygon_to_mask(active.polygon, active.mask.shape)
-        active.accepted = False
+        m.polygon = polygon
+        m.mask = polygon_to_mask(m.polygon, m.mask.shape)
+        m.accepted = False
+        self.active_key = (m.animal_index, m.slice_index)
         self.maskEdited.emit()
         self.update()
 
-    def _hit_test_polygon_vertex(self, polygon: list[tuple[float, float]], img_pt: tuple[float, float]) -> int | None:
-        for idx, p in enumerate(polygon):
-            dx = (p[0] - img_pt[0]) * self._scale
-            dy = (p[1] - img_pt[1]) * self._scale
-            if (dx * dx + dy * dy) ** 0.5 <= HANDLE_HIT_RADIUS_PX:
-                return idx
+    def _hit_test_polygon_vertex_any(self, img_pt: tuple[float, float]) -> tuple[SpecimenMask, int] | None:
+        for m in self.masks:
+            if not m.polygon:
+                continue
+            for idx, p in enumerate(m.polygon):
+                dx = (p[0] - img_pt[0]) * self._scale
+                dy = (p[1] - img_pt[1]) * self._scale
+                if (dx * dx + dy * dy) ** 0.5 <= HANDLE_HIT_RADIUS_PX:
+                    return m, idx
         return None
 
-    def _hit_test_polygon_edge(self, polygon: list[tuple[float, float]], img_pt: tuple[float, float]) -> int | None:
-        """Возвращает индекс, КУДА вставить новую вершину (сразу после начала
-        ближайшего ребра), если клик достаточно близко к какому-то ребру полигона,
+    def _hit_test_polygon_edge_any(self, img_pt: tuple[float, float]) -> tuple[SpecimenMask, int] | None:
+        """Возвращает (маску, индекс КУДА вставить новую вершину) для ближайшего
+        ребра среди ВСЕХ полигонов, если клик достаточно близко к какому-то из них,
         иначе None."""
-        n = len(polygon)
-        best_idx: int | None = None
+        best: tuple[SpecimenMask, int] | None = None
         best_dist = EDGE_HIT_RADIUS_PX / max(self._scale, 1e-6)  # порог в координатах изображения
-        for i in range(n):
-            a, b = np.array(polygon[i]), np.array(polygon[(i + 1) % n])
-            p = np.array(img_pt)
-            ab = b - a
-            ab_len2 = float(ab @ ab)
-            t = 0.0 if ab_len2 == 0 else float(np.clip((p - a) @ ab / ab_len2, 0.0, 1.0))
-            closest = a + t * ab
-            dist = float(np.linalg.norm(p - closest))
-            if dist <= best_dist:
-                best_dist = dist
-                best_idx = i + 1
-        return best_idx
+        p = np.array(img_pt)
+        for m in self.masks:
+            if not m.polygon:
+                continue
+            n = len(m.polygon)
+            for i in range(n):
+                a, b = np.array(m.polygon[i]), np.array(m.polygon[(i + 1) % n])
+                ab = b - a
+                ab_len2 = float(ab @ ab)
+                t = 0.0 if ab_len2 == 0 else float(np.clip((p - a) @ ab / ab_len2, 0.0, 1.0))
+                closest = a + t * ab
+                dist = float(np.linalg.norm(p - closest))
+                if dist <= best_dist:
+                    best_dist = dist
+                    best = (m, i + 1)
+        return best
 
     def wheelEvent(self, event) -> None:  # noqa: N802
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self._zoom_at(event.position(), event.angleDelta().y())
+            return
         delta = event.angleDelta().y()
         factor = 1.15 if delta > 0 else (1 / 1.15)
         self.brush_radius_img = float(np.clip(self.brush_radius_img * factor, 3, 150))
+        self.update()
+
+    def _zoom_at(self, screen_pos: QPointF, wheel_delta: float) -> None:
+        """Зум с "заякориванием" под курсором — точка фото под мышью остаётся на
+        месте на экране (как в обычных просмотрщиках изображений), а не съезжает
+        каждый раз к центру. Без этого не понять, норм ли легли точки полигона на
+        край ткани — нужно приближать именно то место, куда смотришь, не в центр."""
+        if self._draw_rect is None:
+            return
+        anchor_img = self._screen_to_image(screen_pos)
+        factor = 1.15 if wheel_delta > 0 else (1 / 1.15)
+        self._zoom = float(np.clip(self._zoom * factor, MIN_ZOOM, MAX_ZOOM))
+        self._recompute_draw_rect()
+        if anchor_img is not None:
+            new_screen = self._to_screen(anchor_img)
+            self._pan_offset += screen_pos - new_screen
+            self._recompute_draw_rect()
         self.update()
 
     def _paint_brush(self, img_pt: tuple[float, float]) -> None:

@@ -113,7 +113,10 @@ def compare_groups(df: pd.DataFrame, metric: str) -> ComparisonResult:
     )
 
 
-def save_boxplot(df: pd.DataFrame, metric: str, out_path: Path, title: str | None = None) -> None:
+def _build_boxplot_figure(df: pd.DataFrame, metric: str, title: str | None):
+    """Общая отрисовка для save_boxplot (в файл) и boxplot_png_bytes (в интерфейс,
+    рядом с текстом сравнения) — один и тот же график в обоих местах, не два
+    похожих, но постепенно расходящихся куска кода."""
     groups = sorted(df["group"].unique())
     data = [df.loc[df["group"] == g, metric].dropna().to_numpy() for g in groups]
     colors = [color_for_group(i) for i in range(len(groups))]
@@ -142,5 +145,22 @@ def save_boxplot(df: pd.DataFrame, metric: str, out_path: Path, title: str | Non
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
     fig.tight_layout()
+    return fig
+
+
+def save_boxplot(df: pd.DataFrame, metric: str, out_path: Path, title: str | None = None) -> None:
+    fig = _build_boxplot_figure(df, metric, title)
     fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor())
     plt.close(fig)
+
+
+def boxplot_png_bytes(df: pd.DataFrame, metric: str, title: str | None = None) -> bytes:
+    """Тот же график, что и save_boxplot, но в память (PNG-байты) — чтобы показать
+    его прямо в интерфейсе рядом с текстом сравнения, без промежуточного файла."""
+    import io
+
+    fig = _build_boxplot_figure(df, metric, title)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return buf.getvalue()

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QStandardItem, QStandardItemModel
+from PySide6.QtGui import QColor, QPixmap, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QGroupBox, QHBoxLayout,
     QHeaderView, QInputDialog, QLabel, QMessageBox, QPushButton, QSizePolicy,
@@ -22,7 +22,7 @@ from .imaging import choose_best_exposure, contrast_stretch_to_uint8, load_image
 from .measurements import export_table, measure_shot, per_animal_average, rows_to_dataframe
 from .models import GroupConfig, MaskMode, MeasurementRow, ShotReview
 from .segmentation import build_masks_for_image
-from .stats import color_for_group, compare_groups, save_boxplot
+from .stats import boxplot_png_bytes, color_for_group, compare_groups, save_boxplot
 
 PIPELINE_TITLES = {
     MaskMode.WHOLE_BLOB: "Срезы",
@@ -205,8 +205,11 @@ class ReviewTab(QWidget):
             "Подсказка:\n"
             "— левая кнопка мыши рисует, правая стирает;\n"
             "— колесо мыши меняет размер кисти;\n"
+            "— Ctrl + колесо — приблизить/отдалить (под курсором);\n"
+            "— средняя кнопка мыши (зажать и вести) — сдвинуть картинку;\n"
             "— у линии отреза (для черепов) можно потянуть за белые точки;\n"
-            "— в «Режиме точек»: тянуть точку контура — зажать и вести мышью;\n"
+            "— в «Режиме точек»: контур сразу виден у ВСЕХ животных/срезов на\n"
+            "  фото (активный — ярче); тянуть точку — зажать и вести мышью;\n"
             "  добавить точку — двойной клик на линии контура;\n"
             "  убрать точку — клик правой кнопкой по ней (кисть в этом режиме не рисует)."
         )
@@ -450,10 +453,22 @@ class ResultsTab(QWidget):
         self.slice_warning_label.setWordWrap(True)
         stats_layout.addWidget(self.slice_warning_label)
 
+        # текст и график — рядом, а не график отдельным файлом после сохранения:
+        # так сравнение видно целиком, не переключаясь между таблицей и файлом на
+        # диске (раньше график был доступен только через "Сохранить график...")
+        results_row = QHBoxLayout()
         self.stats_output = QTextEdit()
         self.stats_output.setReadOnly(True)
-        self.stats_output.setMaximumHeight(160)
-        stats_layout.addWidget(self.stats_output)
+        self.stats_output.setMaximumHeight(260)
+        results_row.addWidget(self.stats_output, 1)
+
+        self.plot_label = QLabel("График появится здесь после «Сравнить группы»")
+        self.plot_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.plot_label.setStyleSheet("color: #898781; font-style: italic;")
+        self.plot_label.setMinimumSize(360, 260)
+        self.plot_label.setMaximumHeight(260)
+        results_row.addWidget(self.plot_label, 1)
+        stats_layout.addLayout(results_row)
 
         layout.addWidget(stats_box)
 
@@ -646,12 +661,14 @@ class ResultsTab(QWidget):
         animal_df = self._comparison_df(self._animal_df())
         if animal_df.empty or animal_df["group"].nunique() < 2:
             QMessageBox.information(self, "Недостаточно данных", "Нужно минимум 2 группы с принятыми масками.")
+            self._clear_plot_preview()
             return
         metric = self._current_metric_key()
         try:
             result = compare_groups(animal_df, metric)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "Не удалось сравнить", str(exc))
+            self._clear_plot_preview()
             return
 
         slice_index = self.slice_combo.currentData()
@@ -709,6 +726,24 @@ class ResultsTab(QWidget):
             lines.append(f"Размер эффекта (ранговая бисериальная корреляция): {pw.effect_size:+.2f}")
         self.stats_output.setHtml(_format_stats_html(lines))
 
+        png_bytes = boxplot_png_bytes(animal_df, metric, title=self.metric_combo.currentText() + self._plot_title_suffix())
+        pixmap = QPixmap()
+        pixmap.loadFromData(png_bytes, "PNG")
+        self.plot_label.setPixmap(
+            pixmap.scaled(
+                self.plot_label.width() or 360, self.plot_label.height() or 260,
+                Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def _clear_plot_preview(self) -> None:
+        self.plot_label.clear()
+        self.plot_label.setText("График появится здесь после «Сравнить группы»")
+
+    def _plot_title_suffix(self) -> str:
+        slice_index = self.slice_combo.currentData()
+        return " (по животным)" if slice_index is None else f" (срез №{slice_index})"
+
     def _save_plot(self) -> None:
         animal_df = self._comparison_df(self._animal_df())
         if animal_df.empty:
@@ -718,9 +753,7 @@ class ResultsTab(QWidget):
         path, _ = QFileDialog.getSaveFileName(self, "Сохранить график", "сравнение_групп.png", "PNG (*.png)")
         if not path:
             return
-        slice_index = self.slice_combo.currentData()
-        suffix = " (по животным)" if slice_index is None else f" (срез №{slice_index})"
-        save_boxplot(animal_df, metric, Path(path), title=self.metric_combo.currentText() + suffix)
+        save_boxplot(animal_df, metric, Path(path), title=self.metric_combo.currentText() + self._plot_title_suffix())
         QMessageBox.information(self, "Готово", f"График сохранён:\n{path}")
 
 
