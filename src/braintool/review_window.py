@@ -160,7 +160,7 @@ class ProjectTab(QWidget):
 class ReviewTab(QWidget):
     """Вкладка постраничного просмотра и правки автоматически предложенных масок."""
 
-    def __init__(self, on_all_reviewed):
+    def __init__(self, mode: MaskMode, on_all_reviewed):
         super().__init__()
         self._on_all_reviewed = on_all_reviewed
         self.reviews: list[ShotReview] = []
@@ -199,9 +199,11 @@ class ReviewTab(QWidget):
             "Режим точек (тянуть контур за вершины вместо кисти)"
         )
         self.point_mode_checkbox.toggled.connect(self.canvas.set_point_mode_enabled)
-        # включён по умолчанию — оказался удобнее кисти для большинства правок,
-        # человек сам выключит галочку, если для конкретного кадра нужна кисть
-        self.point_mode_checkbox.setChecked(True)
+        # по умолчанию включён для носа/эпителия (ROSTRAL_CUT) — там форма
+        # сложная, полигон обязателен для точной обводки; для срезов (WHOLE_BLOB)
+        # авто-маска обычно неплохая и по умолчанию правится кистью, полигон
+        # включается вручную при необходимости точечной коррекции
+        self.point_mode_checkbox.setChecked(mode == MaskMode.ROSTRAL_CUT)
         side_layout.addWidget(self.point_mode_checkbox)
 
         help_label = QLabel(
@@ -769,7 +771,7 @@ class PipelineTabs(QTabWidget):
         self.mode = mode
 
         self.project_tab = ProjectTab(mode=mode, on_start_review=self._start_review)
-        self.review_tab = ReviewTab(on_all_reviewed=self._finish_review)
+        self.review_tab = ReviewTab(mode=mode, on_all_reviewed=self._finish_review)
         self.results_tab = ResultsTab()
 
         self.addTab(self.project_tab, "1. Проект")
