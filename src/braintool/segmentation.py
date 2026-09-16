@@ -518,3 +518,49 @@ def recompute_rostral_mask_from_line(
     out = np.zeros_like(source_blob, dtype=bool)
     out[ys[keep], xs[keep]] = True
     return out
+
+
+# Максимум вершин полигона при авто-упрощении контура. Больше — таскать мышью
+# неудобно (частокол ручек), меньше — форма грубеет и теряет вогнутости (например,
+# "запятую" носовой полости уже не изобразить). Число подобрано на глаз как разумный
+# компромисс, не измерялось на реальных фото пользователя.
+POLYGON_MAX_POINTS = 40
+
+
+def mask_to_polygon(mask: np.ndarray, max_points: int = POLYGON_MAX_POINTS) -> list[tuple[float, float]] | None:
+    """Строит полигон-контур по растровой маске — отправная точка для правки точками:
+    человек подтягивает уже готовый контур, а не обводит форму с нуля.
+
+    Возвращает None, если в маске нет ни одного закрашенного пикселя (нечего
+    обводить). Если у маски несколько несвязных областей — берётся самая большая
+    по площади (остальные, скорее всего, шум/блик, а не то, что хотели выделить).
+    `approxPolyDP` упрощает контур со всё бОльшим эпсилон, пока число вершин не
+    уложится в `max_points`.
+    """
+    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    contour = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(contour) <= 0:
+        return None
+
+    perimeter = cv2.arcLength(contour, True)
+    epsilon = max(perimeter * 0.002, 0.5)
+    approx = cv2.approxPolyDP(contour, epsilon, True)
+    while len(approx) > max_points:
+        epsilon *= 1.5
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        if epsilon > perimeter:  # защита от бесконечного цикла на вырожденном контуре
+            break
+    return [(float(p[0][0]), float(p[0][1])) for p in approx]
+
+
+def polygon_to_mask(polygon: list[tuple[float, float]], shape: tuple[int, int]) -> np.ndarray:
+    """Растеризует полигон (вершины по кругу, координаты изображения) в bool-маску
+    заданной формы `shape` (высота, ширина) — источник истины для площади/яркости
+    как и раньше остаётся растровая маска, полигон лишь способ её редактировать."""
+    out = np.zeros(shape, dtype=np.uint8)
+    if len(polygon) >= 3:
+        pts = np.array([[int(round(x)), int(round(y))] for x, y in polygon], dtype=np.int32)
+        cv2.fillPoly(out, [pts], 1)
+    return out.astype(bool)

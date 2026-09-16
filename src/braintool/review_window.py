@@ -195,11 +195,20 @@ class ReviewTab(QWidget):
         self.erase_checkbox.toggled.connect(self.canvas.set_erase_enabled)
         side_layout.addWidget(self.erase_checkbox)
 
+        self.point_mode_checkbox = QCheckBox(
+            "Режим точек (тянуть контур за вершины вместо кисти)"
+        )
+        self.point_mode_checkbox.toggled.connect(self.canvas.set_point_mode_enabled)
+        side_layout.addWidget(self.point_mode_checkbox)
+
         help_label = QLabel(
             "Подсказка:\n"
             "— левая кнопка мыши рисует, правая стирает;\n"
             "— колесо мыши меняет размер кисти;\n"
-            "— у линии отреза (для черепов) можно потянуть за белые точки."
+            "— у линии отреза (для черепов) можно потянуть за белые точки;\n"
+            "— в «Режиме точек»: тянуть точку контура — зажать и вести мышью;\n"
+            "  добавить точку — двойной клик на линии контура;\n"
+            "  убрать точку — клик правой кнопкой по ней (кисть в этом режиме не рисует)."
         )
         help_label.setWordWrap(True)
         side_layout.addWidget(help_label)

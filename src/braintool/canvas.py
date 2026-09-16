@@ -8,9 +8,10 @@ from PySide6.QtWidgets import QWidget
 
 from .colors import color_for_animal
 from .models import SpecimenMask
-from .segmentation import recompute_rostral_mask_from_line
+from .segmentation import mask_to_polygon, polygon_to_mask, recompute_rostral_mask_from_line
 
-HANDLE_HIT_RADIUS_PX = 14  # в экранных пикселях
+HANDLE_HIT_RADIUS_PX = 14  # в экранных пикселях — попадание по вершине (клик/тяга)
+EDGE_HIT_RADIUS_PX = 10    # попадание по ребру полигона (двойной клик — добавить точку)
 
 
 class MaskCanvas(QWidget):
@@ -34,10 +35,15 @@ class MaskCanvas(QWidget):
         # состояние чекбокса "Ластик" в боковой панели — независимо от кнопки мыши,
         # чтобы можно было стирать левой кнопкой, не только правой
         self._erase_toggle = False
+        # состояние чекбокса "Режим точек" — альтернатива кисти: маска редактируется
+        # перетаскиванием вершин полигона, а не закрашиванием. Пока включён, кисть
+        # не рисует (мышь целиком уходит на работу с точками активной маски).
+        self._point_mode_enabled = False
 
         self._draw_rect: QRectF | None = None
         self._scale = 1.0
         self._dragging_handle: tuple[SpecimenMask, int] | None = None
+        self._dragging_polygon_vertex: tuple[SpecimenMask, int] | None = None
         self._dragging_brush = False
 
     # ---------- публичный API ----------
@@ -53,10 +59,31 @@ class MaskCanvas(QWidget):
 
     def set_active_mask(self, animal_index: int, slice_index: int) -> None:
         self.active_key = (animal_index, slice_index)
+        if self._point_mode_enabled:
+            active = self._active_mask()
+            if active is not None:
+                self._ensure_polygon(active)
         self.update()
 
     def set_erase_enabled(self, enabled: bool) -> None:
         self._erase_toggle = bool(enabled)
+
+    def set_point_mode_enabled(self, enabled: bool) -> None:
+        self._point_mode_enabled = bool(enabled)
+        if self._point_mode_enabled:
+            active = self._active_mask()
+            if active is not None:
+                self._ensure_polygon(active)
+        self.update()
+
+    def _ensure_polygon(self, m: SpecimenMask) -> None:
+        """Если у маски ещё нет полигона — строит его по текущей растровой маске
+        (отправная точка для правки точками: подтянуть готовый контур, не обводить
+        форму заново с нуля). Пустую маску (нечего обводить) не трогает — полигон
+        появится только после того, как в маске будет хоть что-то (автообнаружение
+        или предварительная правка кистью)."""
+        if m.polygon is None and m.mask.any():
+            m.polygon = mask_to_polygon(m.mask)
 
     def accept_all(self) -> None:
         for m in self.masks:
@@ -118,6 +145,14 @@ class MaskCanvas(QWidget):
             if m.cut_line is not None:
                 self._draw_handles(painter, m, is_active=(m is active))
 
+        # полигон точек показываем ТОЛЬКО у активной маски (в отличие от линии
+        # отреза выше) — упрощение для первой версии, см. известные ограничения
+        # в документации
+        if self._point_mode_enabled and active is not None:
+            self._ensure_polygon(active)
+            if active.polygon:
+                self._draw_polygon_handles(painter, active.polygon)
+
         painter.end()
 
     def _build_composite_rgb(self) -> np.ndarray:
@@ -153,11 +188,52 @@ class MaskCanvas(QWidget):
         painter.setPen(QPen(QColor(255, 255, 255, line_alpha), line_width, Qt.PenStyle.DashLine))
         painter.drawLine(QPointF(sx1, sy1), QPointF(sx2, sy2))
 
+    def _to_screen(self, p: tuple[float, float]) -> QPointF:
+        return QPointF(
+            self._draw_rect.x() + p[0] * self._scale,
+            self._draw_rect.y() + p[1] * self._scale,
+        )
+
+    def _draw_polygon_handles(self, painter: QPainter, polygon: list[tuple[float, float]]) -> None:
+        screen_pts = [self._to_screen(p) for p in polygon]
+        painter.setPen(QPen(QColor(255, 255, 255, 230), 2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        for i in range(len(screen_pts)):
+            painter.drawLine(screen_pts[i], screen_pts[(i + 1) % len(screen_pts)])
+        painter.setBrush(QBrush(QColor(255, 255, 255, 230)))
+        for sp in screen_pts:
+            painter.drawEllipse(sp, 5, 5)
+
     # ---------- взаимодействие мышью ----------
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         img_pt = self._screen_to_image(event.position())
         if img_pt is None:
+            return
+
+        # режим точек полностью забирает мышь себе — кисть в этом режиме не рисует
+        # (переключение между режимами — отдельный чекбокс в боковой панели)
+        if self._point_mode_enabled:
+            active = self._active_mask()
+            if active is not None:
+                self._ensure_polygon(active)
+                if active.polygon:
+                    idx = self._hit_test_polygon_vertex(active.polygon, img_pt)
+                    if idx is not None:
+                        if event.button() == Qt.MouseButton.RightButton:
+                            if len(active.polygon) > 3:
+                                del active.polygon[idx]
+                                active.mask = polygon_to_mask(active.polygon, active.mask.shape)
+                                active.accepted = False
+                                self.maskEdited.emit()
+                                self.update()
+                            return
+                        self._dragging_polygon_vertex = (active, idx)
+                        self.update()
+                        return
+            # клик мимо вершины в режиме точек ничего не делает — добавление точки
+            # только двойным кликом на ребре (mouseDoubleClickEvent), одиночный клик
+            # по пустому месту не должен случайно создавать новую точку
             return
 
         # ручки видны у всех животных сразу (не только у активного) — ищем среди всех,
@@ -186,6 +262,16 @@ class MaskCanvas(QWidget):
         img_pt = self._screen_to_image(event.position())
         if img_pt is None:
             return
+        if self._dragging_polygon_vertex is not None:
+            # во время перетаскивания растр НЕ пересчитывается на каждый пиксель
+            # движения (только контур-превью) — как и с cut_line ниже, растеризация
+            # в mask происходит один раз на отпускании кнопки (mouseReleaseEvent)
+            m, idx = self._dragging_polygon_vertex
+            polygon = list(m.polygon)
+            polygon[idx] = img_pt
+            m.polygon = polygon
+            self.update()
+            return
         if self._dragging_handle is not None:
             m, idx = self._dragging_handle
             other = m.cut_line[1 - idx]
@@ -197,6 +283,13 @@ class MaskCanvas(QWidget):
             self._paint_brush(img_pt)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if self._dragging_polygon_vertex is not None:
+            m, _ = self._dragging_polygon_vertex
+            m.mask = polygon_to_mask(m.polygon, m.mask.shape)
+            m.accepted = False
+            self._dragging_polygon_vertex = None
+            self.maskEdited.emit()
+            self.update()
         if self._dragging_handle is not None:
             m, _ = self._dragging_handle
             if m.source_blob is not None and m.cut_line is not None:
@@ -216,6 +309,58 @@ class MaskCanvas(QWidget):
             self._dragging_brush = False
             self.maskEdited.emit()
 
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
+        """Двойной клик на ребре полигона (только в режиме точек) — добавляет
+        вершину в этом месте. Одиночный клик рядом с ребром намеренно ничего не
+        делает (см. mousePressEvent) — иначе случайная новая точка при попытке
+        просто перетащить существующую была бы неотличима от намеренного добавления."""
+        if not self._point_mode_enabled:
+            return
+        img_pt = self._screen_to_image(event.position())
+        if img_pt is None:
+            return
+        active = self._active_mask()
+        if active is None or not active.polygon:
+            return
+        insert_at = self._hit_test_polygon_edge(active.polygon, img_pt)
+        if insert_at is None:
+            return
+        polygon = list(active.polygon)
+        polygon.insert(insert_at, img_pt)
+        active.polygon = polygon
+        active.mask = polygon_to_mask(active.polygon, active.mask.shape)
+        active.accepted = False
+        self.maskEdited.emit()
+        self.update()
+
+    def _hit_test_polygon_vertex(self, polygon: list[tuple[float, float]], img_pt: tuple[float, float]) -> int | None:
+        for idx, p in enumerate(polygon):
+            dx = (p[0] - img_pt[0]) * self._scale
+            dy = (p[1] - img_pt[1]) * self._scale
+            if (dx * dx + dy * dy) ** 0.5 <= HANDLE_HIT_RADIUS_PX:
+                return idx
+        return None
+
+    def _hit_test_polygon_edge(self, polygon: list[tuple[float, float]], img_pt: tuple[float, float]) -> int | None:
+        """Возвращает индекс, КУДА вставить новую вершину (сразу после начала
+        ближайшего ребра), если клик достаточно близко к какому-то ребру полигона,
+        иначе None."""
+        n = len(polygon)
+        best_idx: int | None = None
+        best_dist = EDGE_HIT_RADIUS_PX / max(self._scale, 1e-6)  # порог в координатах изображения
+        for i in range(n):
+            a, b = np.array(polygon[i]), np.array(polygon[(i + 1) % n])
+            p = np.array(img_pt)
+            ab = b - a
+            ab_len2 = float(ab @ ab)
+            t = 0.0 if ab_len2 == 0 else float(np.clip((p - a) @ ab / ab_len2, 0.0, 1.0))
+            closest = a + t * ab
+            dist = float(np.linalg.norm(p - closest))
+            if dist <= best_dist:
+                best_dist = dist
+                best_idx = i + 1
+        return best_idx
+
     def wheelEvent(self, event) -> None:  # noqa: N802
         delta = event.angleDelta().y()
         factor = 1.15 if delta > 0 else (1 / 1.15)
@@ -226,10 +371,13 @@ class MaskCanvas(QWidget):
         target = self._active_mask()
         if target is None:
             return
-        # рисование кистью "отвязывает" маску от параметрической линии отреза —
-        # дальше это обычная растровая маска, которую правят только кистью
+        # рисование кистью "отвязывает" маску от параметрической линии отреза и от
+        # полигона — дальше это обычная растровая маска, которую правят только
+        # кистью (полигон при повторном включении режима точек будет перестроен
+        # заново по уже подправленному кистью растру)
         target.cut_line = None
         target.source_blob = None
+        target.polygon = None
 
         h, w = target.mask.shape
         yy, xx = np.ogrid[:h, :w]
