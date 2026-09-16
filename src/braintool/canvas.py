@@ -105,6 +105,16 @@ class MaskCanvas(QWidget):
             m.accepted = True
         self.update()
 
+    def _mask_at_point(self, img_pt: tuple[float, float]) -> SpecimenMask | None:
+        """Первая маска (в порядке self.masks), чей растр покрывает эту точку
+        изображения — используется, чтобы клик по маске выбирал её активной."""
+        x, y = int(round(img_pt[0])), int(round(img_pt[1]))
+        for m in self.masks:
+            h, w = m.mask.shape
+            if 0 <= y < h and 0 <= x < w and m.mask[y, x]:
+                return m
+        return None
+
     def _active_mask(self) -> SpecimenMask | None:
         if self.active_key is None:
             return None
@@ -278,6 +288,17 @@ class MaskCanvas(QWidget):
                     self.active_key = (m.animal_index, m.slice_index)
                     self.update()
                     return
+
+        # клик по уже размеченной маске (кисть, вне режима точек) сначала выбирает
+        # её активной, как и с ручками cut_line/полигона выше — раньше рисование/
+        # стирание всегда шло в маску, выбранную ранее в списке слева, даже если
+        # курсор был над СОВСЕМ ДРУГИМ животным на фото; неудобно на многоживотных
+        # фото по сравнению с пайплайном "нос", где клик по линии сам переключает
+        # активное животное. Клик по пустому фону активное животное не меняет —
+        # так по-прежнему можно дорисовывать маску наружу за её текущий край
+        hit_mask = self._mask_at_point(img_pt)
+        if hit_mask is not None:
+            self.active_key = (hit_mask.animal_index, hit_mask.slice_index)
 
         self._dragging_brush = True
         # правая кнопка стирает всегда; левая — стирает, только если включён чекбокс

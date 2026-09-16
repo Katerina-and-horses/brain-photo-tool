@@ -199,6 +199,9 @@ class ReviewTab(QWidget):
             "Режим точек (тянуть контур за вершины вместо кисти)"
         )
         self.point_mode_checkbox.toggled.connect(self.canvas.set_point_mode_enabled)
+        # включён по умолчанию — оказался удобнее кисти для большинства правок,
+        # человек сам выключит галочку, если для конкретного кадра нужна кисть
+        self.point_mode_checkbox.setChecked(True)
         side_layout.addWidget(self.point_mode_checkbox)
 
         help_label = QLabel(
