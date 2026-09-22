@@ -123,4 +123,8 @@ def export_table(df: pd.DataFrame, path: Path) -> None:
     if path.suffix.lower() in (".xlsx", ".xls"):
         df.to_excel(path, index=False)
     else:
-        df.to_csv(path, index=False, encoding="utf-8-sig")
+        # разделитель ";" и "," как десятичный — не pandas-дефолт, но у Excel в
+        # русской локали запятая зарезервирована под десятичный разделитель, и
+        # с обычным CSV (",", ".") двойной клик по файлу сваливает все колонки
+        # в одну ячейку A, а числа с точкой распознаются как текст
+        df.to_csv(path, index=False, encoding="utf-8-sig", sep=";", decimal=",")

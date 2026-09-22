@@ -128,13 +128,32 @@ class ProjectTab(QWidget):
 
     def _collect_groups(self) -> list[GroupConfig] | None:
         groups: list[GroupConfig] = []
+        seen_names: set[str] = set()
         for row in range(self.table.rowCount()):
-            name = self.table.item(row, 0).text()
+            name = self.table.item(row, 0).text().strip()
             folder = self.table.item(row, 1).text()
             cols = self.table.cellWidget(row, 2).value()
             is_control = self.table.cellWidget(row, 3).findChild(QCheckBox).isChecked()
             condition_item = self.table.item(row, 4)
             condition = condition_item.text().strip() if condition_item else ""
+            # название группы редактируется прямо в ячейке таблицы (двойной клик) —
+            # пустое или повторяющееся имя молча сливает разные папки/животных в один
+            # ряд статистики (per_animal_average группирует именно по этому имени)
+            if not name:
+                QMessageBox.warning(
+                    self, "Пустое название группы",
+                    f"Строка {row + 1}: укажите название группы (сейчас пусто).",
+                )
+                return None
+            if name in seen_names:
+                QMessageBox.warning(
+                    self, "Повторяющееся название группы",
+                    f"Название «{name}» использовано больше одного раза — разные папки "
+                    "с одинаковым именем группы молча объединятся в статистике в одну "
+                    "группу. Переименуйте одну из них.",
+                )
+                return None
+            seen_names.add(name)
             try:
                 groups.append(
                     GroupConfig(
@@ -320,6 +339,22 @@ class ReviewTab(QWidget):
         if not self.reviews:
             return
         review = self.reviews[self.current_index]
+        # безусловная замена review.masks стирает ЛЮБУЮ уже сделанную ручную правку
+        # (кисть, линия отреза, точки контура) и все "принято" на этом кадре — в
+        # отличие от перехода Next/Prev, у которого есть _confirm_leave_unaccepted,
+        # у этой кнопки раньше не было никакой защиты вообще
+        if any(m.mask.any() for m in review.masks):
+            box = QMessageBox(self)
+            box.setWindowTitle("Пересчитать автоматически заново?")
+            box.setText(
+                "Это заменит ВСЕ маски на этом фото свежими автоматическими — любая "
+                "ручная правка (кисть, линия отреза, точки контура) и отметки «принято» "
+                "на этом фото будут потеряны без возможности отменить. Продолжить?"
+            )
+            box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
+            box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+            if box.exec() != QMessageBox.StandardButton.Yes:
+                return
         masks, warning = build_masks_for_image(review.image, review.shot.group)
         review.masks = masks
         review.warning = warning
@@ -542,6 +577,12 @@ class ResultsTab(QWidget):
             df = per_animal_average(filtered)
         else:
             df = filtered
+        # сортируем здесь, ДО сохранения в self.current_df — иначе таблица на экране
+        # (сортированная в _show_dataframe) и файл, который уходит при экспорте
+        # (self.current_df), расходятся по порядку строк
+        if "group" in df.columns and not df.empty:
+            sort_cols = [c for c in ("group", "animal_index", "slice_index") if c in df.columns]
+            df = df.sort_values(sort_cols, kind="stable").reset_index(drop=True)
         self.current_df = df
         self._show_dataframe(df)
         self._refresh_slice_warning()
@@ -596,12 +637,9 @@ class ResultsTab(QWidget):
             )
 
     def _show_dataframe(self, df: pd.DataFrame) -> None:
-        # визуально группируем строки по группе — раньше порядок был "как пришло",
-        # из-за чего строки одной группы могли перемежаться со строками другой
-        if "group" in df.columns and not df.empty:
-            sort_cols = [c for c in ("group", "animal_index", "slice_index") if c in df.columns]
-            df = df.sort_values(sort_cols, kind="stable").reset_index(drop=True)
-
+        # сортировка по группе уже применена вызывающим кодом (_refresh_table) —
+        # тут только рендер, чтобы таблица на экране и self.current_df (экспорт)
+        # были гарантированно в одном и том же порядке строк
         model = QStandardItemModel(df.shape[0], df.shape[1])
         model.setHorizontalHeaderLabels(list(df.columns))
         group_colors: dict[str, QColor] = {}
@@ -628,7 +666,19 @@ class ResultsTab(QWidget):
         )
         if not path:
             return
-        export_table(self.current_df, Path(path))
+        try:
+            export_table(self.current_df, Path(path))
+        except Exception as exc:  # noqa: BLE001
+            # без этого исключение (файл занят в Excel, диск недоступен и т.п.) гасится
+            # где-то на границе диспетчера сигналов Qt МОЛЧА — ни ошибки, ни "Готово" не
+            # появляется, а собранный exe без консоли (console=False) не показывает даже
+            # traceback в stderr; пользователь считает, что данные сохранены, хотя нет
+            QMessageBox.warning(
+                self, "Не удалось сохранить",
+                f"Таблица не сохранена:\n{exc}\n\nЕсли файл открыт в Excel или другой "
+                "программе — закройте его и попробуйте снова.",
+            )
+            return
         QMessageBox.information(self, "Готово", f"Таблица сохранена:\n{path}")
 
     def _animal_df(self) -> pd.DataFrame:
@@ -758,7 +808,18 @@ class ResultsTab(QWidget):
         path, _ = QFileDialog.getSaveFileName(self, "Сохранить график", "сравнение_групп.png", "PNG (*.png)")
         if not path:
             return
-        save_boxplot(animal_df, metric, Path(path), title=self.metric_combo.currentText() + self._plot_title_suffix())
+        try:
+            save_boxplot(animal_df, metric, Path(path), title=self.metric_combo.currentText() + self._plot_title_suffix())
+        except Exception as exc:  # noqa: BLE001
+            # тот же класс тихого отказа, что и в _export_table — без try/except
+            # исключение гасится без единого диалога, пользователь решает, что график
+            # сохранён, хотя файла нет
+            QMessageBox.warning(
+                self, "Не удалось сохранить",
+                f"График не сохранён:\n{exc}\n\nЕсли файл открыт в другой программе — "
+                "закройте его и попробуйте снова.",
+            )
+            return
         QMessageBox.information(self, "Готово", f"График сохранён:\n{path}")
 
 
@@ -781,6 +842,22 @@ class PipelineTabs(QTabWidget):
         self.setTabEnabled(2, False)
 
     def _start_review(self, groups: list[GroupConfig]) -> None:
+        # повторный запуск (например, случайный клик по вкладке "1. Проект" и снова
+        # "Начать проверку масок") безусловно заменял бы self.review_tab.reviews —
+        # вся уже сделанная разметка (возможно, по многим фото) терялась бы молча
+        if self.review_tab.reviews and any(m.mask.any() for r in self.review_tab.reviews for m in r.masks):
+            box = QMessageBox(self)
+            box.setWindowTitle("Начать проверку масок заново?")
+            box.setText(
+                "На вкладке «2. Проверка масок» уже есть результаты предыдущего запуска "
+                "(правки и отметки «принято») — они будут заменены новыми и потеряны "
+                "без возможности отменить. Продолжить?"
+            )
+            box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
+            box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+            if box.exec() != QMessageBox.StandardButton.Yes:
+                return
+
         reviews: list[ShotReview] = []
         problems: list[str] = []
         for group in groups:
@@ -793,10 +870,22 @@ class PipelineTabs(QTabWidget):
                 problems.append(f"Группа «{group.name}»: в папке не найдено подходящих фото")
                 continue
             for shot in shots:
-                path = choose_best_exposure(shot)
-                image = load_image(path)
-                masks, warning = build_masks_for_image(image, group)
-                display = contrast_stretch_to_uint8(image)
+                # один битый/нестандартный файл (повреждённый TIFF, файл ещё пишется
+                # камерой, недостаточно памяти на большом фото и т.п.) раньше ронял
+                # необработанным исключением ВЕСЬ запуск проверки (все группы разом),
+                # без единого сообщения пользователю (exe собран без консоли) — теперь
+                # такой кадр просто пропускается со списком остальных проблем
+                try:
+                    path = choose_best_exposure(shot)
+                    image = load_image(path)
+                    masks, warning = build_masks_for_image(image, group)
+                    display = contrast_stretch_to_uint8(image)
+                except Exception as exc:  # noqa: BLE001
+                    problems.append(
+                        f"Группа «{group.name}», кадр «{shot.shot_key}»: не удалось "
+                        f"обработать ({exc}) — кадр пропущен."
+                    )
+                    continue
                 reviews.append(ShotReview(shot=shot, image=image, display_image=display, masks=masks, warning=warning))
 
         if problems:

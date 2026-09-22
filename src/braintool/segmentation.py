@@ -350,13 +350,20 @@ def _find_rostral_boundary_bin(profile: np.ndarray) -> int:
 
 def compute_rostral_cut(
     blob_mask: np.ndarray,
-) -> tuple[np.ndarray, tuple[tuple[float, float], tuple[float, float]]]:
+) -> tuple[np.ndarray, tuple[tuple[float, float], tuple[float, float]], bool]:
     """Отделяет "носовую" (переднюю, лицевую) часть черепа от мозговой коробки.
 
     Находим главную ось вытянутости пятна (PCA), строим профиль ширины пятна
     вдоль этой оси и ищем анатомическую "талию" между лицевым отделом и
     мозговой коробкой (см. `_find_rostral_boundary_bin`). Это только стартовое
     предложение — линию отреза можно будет перетащить в интерфейсе.
+
+    Третий элемент возврата — `is_elongated`: False, если пятно недостаточно
+    вытянуто (близко к кругу) — направление главной оси PCA у таких пятен
+    численно неустойчиво (мелкий шум формы может развернуть его на произвольный
+    угол), см. раздел 7 документации. Не блокирует результат (линия всё равно
+    строится и её можно перетащить), только сигнализирует вызывающему коду, что
+    её стоит проверить вручную внимательнее обычного.
     """
     ys, xs = np.nonzero(blob_mask)
     pts = np.column_stack([xs, ys]).astype(np.float64)
@@ -366,6 +373,10 @@ def compute_rostral_cut(
     cov = np.cov(centered.T)
     eigvals, eigvecs = np.linalg.eigh(cov)
     main_axis = eigvecs[:, int(np.argmax(eigvals))]
+    # порог 1.5 подобран на глаз (не измерялся на реальных фото) — задача не
+    # точная классификация формы, а грубый явный сигнал "проверьте вручную"
+    # вместо молчаливо неверного направления на почти круглых пятнах
+    is_elongated = float(eigvals.max() / max(eigvals.min(), 1e-9)) >= 1.5
 
     proj = centered @ main_axis
 
@@ -426,7 +437,7 @@ def compute_rostral_cut(
     p1 = (float(np.clip(p1[0], 0, img_w - 1)), float(np.clip(p1[1], 0, img_h - 1)))
     p2 = (float(np.clip(p2[0], 0, img_w - 1)), float(np.clip(p2[1], 0, img_h - 1)))
 
-    return rostral_mask, (p1, p2)
+    return rostral_mask, (p1, p2), is_elongated
 
 
 def build_masks_for_image(
@@ -449,6 +460,7 @@ def build_masks_for_image(
         assignment, resolved_rows, warning = assign_blobs_to_grid(blobs, group.cols, group.rows)
 
     masks: list[SpecimenMask] = []
+    poorly_elongated_animals: list[int] = []
     for animal_index in range(group.cols):
         for slice_index in range(resolved_rows):
             blob = assignment.get((animal_index, slice_index))
@@ -471,7 +483,9 @@ def build_masks_for_image(
                     )
                 )
             else:  # ROSTRAL_CUT
-                rostral_mask, cut_line = compute_rostral_cut(blob.mask)
+                rostral_mask, cut_line, is_elongated = compute_rostral_cut(blob.mask)
+                if not is_elongated:
+                    poorly_elongated_animals.append(animal_index + 1)
                 masks.append(
                     SpecimenMask(
                         animal_index=animal_index,
@@ -482,6 +496,15 @@ def build_masks_for_image(
                         rostral_anchor=_mask_centroid(rostral_mask),
                     )
                 )
+
+    if poorly_elongated_animals:
+        note = (
+            "Форма пятна слабо вытянута у животных: "
+            + ", ".join(str(a) for a in sorted(set(poorly_elongated_animals)))
+            + " — направление линии отреза в этом случае менее надёжно (см. документацию, "
+            "раздел 7), проверьте вручную внимательнее обычного."
+        )
+        warning = f"{warning}\n{note}" if warning else note
 
     masks.sort(key=lambda m: (m.animal_index, m.slice_index))
     return masks, warning

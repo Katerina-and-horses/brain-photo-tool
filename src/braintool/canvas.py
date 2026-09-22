@@ -88,16 +88,18 @@ class MaskCanvas(QWidget):
         (отправная точка для правки точками: подтянуть готовый контур, не обводить
         форму заново с нуля). Пустую маску (нечего обводить) не трогает — полигон
         появится только после того, как в маске будет хоть что-то (автообнаружение
-        или предварительная правка кистью)."""
+        или предварительная правка кистью).
+
+        НЕ трогает `cut_line`/`source_blob` — это только построение временного
+        отображаемого контура (вызывается при каждом показе фото, до какой-либо
+        правки пользователя), а не правка маски. cut_line/source_blob остаются
+        рабочими и отвязываются от маски только при РЕАЛЬНОЙ правке точками (см.
+        mousePressEvent/mouseReleaseEvent/mouseDoubleClickEvent) — иначе включение
+        режима точек по умолчанию (пайплайн носа) безвозвратно убивало бы
+        перетаскиваемую линию отреза ещё до того, как пользователь вообще
+        посмотрел на кадр, даже если он тут же выключит "Режим точек" обратно."""
         if m.polygon is None and m.mask.any():
             m.polygon = mask_to_polygon(m.mask)
-            # полигон — самостоятельное векторное представление формы; линия
-            # отреза (ROSTRAL_CUT), если она была, в режиме точек не тянется
-            # (mousePressEvent до её хит-теста не доходит) и только рисовалась
-            # бы поверх контура полигона, загромождая картинку — отвязываем,
-            # как и кисть уже отвязывает маску от cut_line/source_blob
-            m.cut_line = None
-            m.source_blob = None
 
     def _ensure_all_polygons(self) -> None:
         """Полигоны нужны у ВСЕХ масок сразу (не только активной) — иначе при
@@ -178,11 +180,15 @@ class MaskCanvas(QWidget):
 
         # черепа на фото не лежат идеально по линейке, поэтому у каждого животного
         # своя независимая линия отреза — показываем и даём тянуть их ВСЕ сразу,
-        # а не только у активного животного (иначе остальные 4 не видно и не поправить)
+        # а не только у активного животного (иначе остальные 4 не видно и не поправить).
+        # В режиме точек мышь на cut_line всё равно не реагирует (mousePressEvent
+        # обрабатывает точки раньше и не доходит до хит-теста ручек) — не рисуем
+        # их поверх контура полигона, только загромождали бы картинку
         active = self._active_mask()
-        for m in self.masks:
-            if m.cut_line is not None:
-                self._draw_handles(painter, m, is_active=(m is active))
+        if not self._point_mode_enabled:
+            for m in self.masks:
+                if m.cut_line is not None:
+                    self._draw_handles(painter, m, is_active=(m is active))
 
         # полигон точек — по той же логике, что и линия отреза выше: ВСЕ маски сразу,
         # активная ярче. Раньше показывалась только активная — оказалось неудобно
@@ -269,6 +275,8 @@ class MaskCanvas(QWidget):
                     if len(m.polygon) > 3:
                         del m.polygon[idx]
                         m.mask = polygon_to_mask(m.polygon, m.mask.shape)
+                        m.cut_line = None
+                        m.source_blob = None
                         m.accepted = False
                         self.maskEdited.emit()
                     self.update()
@@ -276,9 +284,20 @@ class MaskCanvas(QWidget):
                 self._dragging_polygon_vertex = (m, idx)
                 self.update()
                 return
-            # клик мимо вершины в режиме точек ничего не делает — добавление точки
-            # только двойным кликом на ребре (mouseDoubleClickEvent), одиночный клик
-            # по пустому месту не должен случайно создавать новую точку
+            # клик мимо вершины в режиме точек НАМЕРЕННО ничего не делает для маски,
+            # у которой уже есть контур — добавление точки только двойным кликом на
+            # ребре (mouseDoubleClickEvent), одиночный клик по пустому месту не должен
+            # случайно создавать новую точку. НО если у активной маски контура ещё нет
+            # (пустая ячейка — например, авто-детекция не нашла череп, см. секцию 3.3/3.4
+            # документации), то обвести нечего, и хит-тест выше никогда не сработает —
+            # без этой ветки такую маску было вообще невозможно нарисовать в режиме
+            # точек (клик молча ничего не делал). Кисть остаётся способом создать
+            # первый мазок; контур для него построится сам при следующей отрисовке
+            active = self._active_mask()
+            if active is not None and active.polygon is None:
+                self._dragging_brush = True
+                self.erase_mode = self._erase_toggle or event.button() == Qt.MouseButton.RightButton
+                self._paint_brush(img_pt)
             return
 
         # ручки видны у всех животных сразу (не только у активного) — ищем среди всех,
@@ -353,6 +372,8 @@ class MaskCanvas(QWidget):
         if self._dragging_polygon_vertex is not None:
             m, _ = self._dragging_polygon_vertex
             m.mask = polygon_to_mask(m.polygon, m.mask.shape)
+            m.cut_line = None
+            m.source_blob = None
             m.accepted = False
             self._dragging_polygon_vertex = None
             self.maskEdited.emit()
@@ -360,15 +381,25 @@ class MaskCanvas(QWidget):
         if self._dragging_handle is not None:
             m, _ = self._dragging_handle
             if m.source_blob is not None and m.cut_line is not None:
-                # опорная точка фиксируется один раз при автоопределении (центроид
-                # изначальной носовой части) и не пересчитывается — иначе при
-                # перетаскивании линии сторона выбора могла неожиданно инвертироваться
-                ref = m.rostral_anchor if m.rostral_anchor is not None else (0.0, 0.0)
-                m.mask = recompute_rostral_mask_from_line(m.source_blob, m.cut_line, ref)
-                # перетаскивание линии — тоже правка; раньше только кисть сбрасывала
-                # "принято", и перетащенная-но-непроверенная маска могла остаться
-                # помеченной как принятая
-                m.accepted = False
+                p1, p2 = m.cut_line
+                degenerate = (p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2 < 1.0
+                if degenerate:
+                    # обе ручки сведены практически в одну точку — направление линии
+                    # не определено; пересчёт по такой линии молча отдал бы под "нос"
+                    # весь исходный blob целиком (весь череп). Оставляем маску как
+                    # была — пользователь должен развести ручки снова, а не получить
+                    # тихо неверный результат
+                    pass
+                else:
+                    # опорная точка фиксируется один раз при автоопределении (центроид
+                    # изначальной носовой части) и не пересчитывается — иначе при
+                    # перетаскивании линии сторона выбора могла неожиданно инвертироваться
+                    ref = m.rostral_anchor if m.rostral_anchor is not None else (0.0, 0.0)
+                    m.mask = recompute_rostral_mask_from_line(m.source_blob, m.cut_line, ref)
+                    # перетаскивание линии — тоже правка; раньше только кисть сбрасывала
+                    # "принято", и перетащенная-но-непроверенная маска могла остаться
+                    # помеченной как принятая
+                    m.accepted = False
             self._dragging_handle = None
             self.maskEdited.emit()
             self.update()
@@ -395,6 +426,8 @@ class MaskCanvas(QWidget):
         polygon.insert(insert_at, img_pt)
         m.polygon = polygon
         m.mask = polygon_to_mask(m.polygon, m.mask.shape)
+        m.cut_line = None
+        m.source_blob = None
         m.accepted = False
         self.active_key = (m.animal_index, m.slice_index)
         self.maskEdited.emit()
@@ -424,6 +457,15 @@ class MaskCanvas(QWidget):
             n = len(m.polygon)
             for i in range(n):
                 a, b = np.array(m.polygon[i]), np.array(m.polygon[(i + 1) % n])
+                # клик почти точно на одном из концов ребра — это попытка попасть по
+                # СУЩЕСТВУЮЩЕЙ вершине (двойной клик по ней проходит Press на первом
+                # клике, который уже начинает перетаскивание), а не по середине ребра;
+                # не считаем это ребро кандидатом на вставку новой точки, иначе почти
+                # каждый двойной клик по вершине незаметно дублирует её вырожденной
+                # соседней точкой (нулевой длины ребро)
+                edge_hit_radius_img = EDGE_HIT_RADIUS_PX / max(self._scale, 1e-6)
+                if np.linalg.norm(p - a) <= edge_hit_radius_img or np.linalg.norm(p - b) <= edge_hit_radius_img:
+                    continue
                 ab = b - a
                 ab_len2 = float(ab @ ab)
                 t = 0.0 if ab_len2 == 0 else float(np.clip((p - a) @ ab / ab_len2, 0.0, 1.0))
