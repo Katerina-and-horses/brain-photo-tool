@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -18,10 +19,28 @@ _EXPOSURE_RE = re.compile(r"exp(\d+)", re.IGNORECASE)
 # доля пикселей на грани диапазона (>=250 из 255 / >=98% от макс. значения),
 # после которой кадр считается «засвеченным»
 SATURATION_FRACTION_LIMIT = 0.002
+# засвет ВНУТРИ принятых масок, при котором выдержка не годится для анализа яркости
+# (0,1% пикселей маски у предела шкалы; решение пользователя, сессия 7)
+MASK_SATURATION_FRACTION_LIMIT = 0.001
 
 
 def load_image(path: Path) -> np.ndarray:
-    """Читает изображение как numpy-массив, сохраняя исходную битность."""
+    """Читает изображение как numpy-массив, сохраняя исходную битность.
+
+    Кешируется (одни и те же файлы выдержек перечитываются при подборе выдержки,
+    пересчёте таблицы и т.п.); массив из кеша помечен только-для-чтения — менять
+    его на месте нельзя, только копию."""
+    return _load_image_cached(str(Path(path).resolve()), Path(path).stat().st_mtime_ns)
+
+
+@lru_cache(maxsize=48)
+def _load_image_cached(path_str: str, _mtime_ns: int) -> np.ndarray:
+    arr = _read_image(Path(path_str))
+    arr.setflags(write=False)
+    return arr
+
+
+def _read_image(path: Path) -> np.ndarray:
     if path.suffix.lower() in (".tif", ".tiff"):
         arr = tifffile.imread(str(path))
     else:
@@ -110,3 +129,45 @@ def choose_best_exposure(shot: Shot) -> Path:
     chosen = best_ok if best_ok is not None else fallback_best[:2]
     shot.chosen_exposure = chosen[0]
     return chosen[1]
+
+
+def saturation_limit_value(arr: np.ndarray) -> float | None:
+    """Значение, начиная с которого пиксель считается засвеченным (98% шкалы файла),
+    или None для нецелочисленных изображений (предел датчика неизвестен)."""
+    if not np.issubdtype(arr.dtype, np.integer):
+        return None
+    return float(np.iinfo(arr.dtype).max) * 0.98
+
+
+def unsaturated_exposures(shot: Shot) -> list[int]:
+    """Выдержки кадра без засвета по всему кадру (как в `choose_best_exposure`), от
+    самой длинной к самой короткой."""
+    ok: list[int] = []
+    for exposure, path in sorted(shot.exposure_files.items(), reverse=True):
+        frac = _saturation_fraction(load_image(path))
+        if frac is None or frac <= SATURATION_FRACTION_LIMIT:
+            ok.append(exposure)
+    return ok
+
+
+def choose_mask_exposure(shot: Shot) -> int:
+    """Выдержка, на которой ищутся маски (сессия 7): ВТОРАЯ по длине незасвеченная —
+    на самой длинной вокруг срезов больше свечения и мусора, а форма среза от выдержки
+    не зависит. Если незасвеченная одна — она; если все засвечены — наименее
+    засвеченная (как раньше в `choose_best_exposure`)."""
+    ok = unsaturated_exposures(shot)
+    if len(ok) >= 2:
+        return ok[1]
+    if ok:
+        return ok[0]
+    choose_best_exposure(shot)
+    return shot.chosen_exposure
+
+
+def mask_saturation_fraction(image: np.ndarray, union_mask: np.ndarray) -> float:
+    """Доля засвеченных пикселей внутри маски (0 для float-изображений и пустой маски)."""
+    limit = saturation_limit_value(image)
+    n = int(union_mask.sum())
+    if limit is None or n == 0:
+        return 0.0
+    return float(np.count_nonzero(image[union_mask] >= limit)) / n

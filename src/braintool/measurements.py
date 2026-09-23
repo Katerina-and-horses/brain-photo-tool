@@ -100,9 +100,12 @@ def per_animal_average(df: pd.DataFrame) -> pd.DataFrame:
     # mode — в ключ группировки: даже если пользователь случайно назвал две группы
     # одинаково (например, папку "череп и мозг" и папку "срезы" одного животного назвал
     # одним и тем же именем группы), их измерения не должны усредниться в одну строку
-    key_cols = ["group", "mode", "source_file", "animal_index"]
+    # exposure_ms — тоже в ключ: в режиме «все выдержки» у одного животного строки на
+    # нескольких выдержках, их нельзя сливать в одно среднее (dropna=False — выдержка
+    # может быть неизвестна, если в имени файла нет exp<N>)
+    key_cols = ["group", "mode", "source_file", "animal_index", "exposure_ms"]
     out_rows: list[dict] = []
-    for key, g in df.groupby(key_cols, sort=False):
+    for key, g in df.groupby(key_cols, sort=False, dropna=False):
         n = g["area_px"].to_numpy(dtype=np.float64)
         means = g["mean_intensity"].to_numpy(dtype=np.float64)
         stds = g["std_intensity"].to_numpy(dtype=np.float64)
@@ -117,7 +120,6 @@ def per_animal_average(df: pd.DataFrame) -> pd.DataFrame:
         row["area_px"] = float(g["area_px"].mean())
         row["mean_intensity"] = pooled_mean
         row["std_intensity"] = float(np.sqrt(max(pooled_var, 0.0)))
-        row["exposure_ms"] = g["exposure_ms"].iloc[0]
         # метка группы одна и та же для всех срезов/кадров одной группы — просто
         # переносим, как и exposure_ms, без участия в ключе группировки
         row["is_control"] = bool(g["is_control"].iloc[0])
