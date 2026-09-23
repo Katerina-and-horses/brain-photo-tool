@@ -165,54 +165,138 @@ def _split_into_columns(blobs: list[Blob], cols: int) -> list[list[Blob]]:
     return columns
 
 
+# --- раскладка срезов по животным (режим WHOLE_BLOB, сессия 7) ---
+# Столбец-животное отделяется от соседнего, если между центрами соседних (по X) пятен
+# промежуток больше этой доли медианной ширины пятна. Срезы одного животного лежат
+# столбиком со сдвигом по X на десятки пикселей, соседние животные — на 130+ пикселей
+# (замеры на фото LbL, ширина среза ~60–100 px).
+COLUMN_GAP_WIDTH_FRACTION = 0.6
+COLUMN_GAP_MIN_PX = 40.0
+# столбец, чья суммарная площадь меньше этой доли медианной площади столбца, считается
+# мусором (одиночная пылинка/блик в углу кадра), а не животным
+JUNK_COLUMN_AREA_FRACTION = 0.15
+# два пятна в одном столбце — куски ОДНОГО среза, если их диапазоны по Y перекрываются
+# больше чем на эту долю высоты меньшего из них (срез, разрезанный тёмной полоской)
+SAME_SLICE_Y_OVERLAP = 0.5
+
+
+def _blob_x_width(blob: Blob) -> int:
+    xs = np.flatnonzero(blob.mask.any(axis=0))
+    return int(xs[-1] - xs[0] + 1) if xs.size else 0
+
+
+def _blob_y_range(blob: Blob) -> tuple[int, int]:
+    ys = np.flatnonzero(blob.mask.any(axis=1))
+    return (int(ys[0]), int(ys[-1]) + 1) if ys.size else (0, 0)
+
+
+def _merge_blobs(parts: list[Blob]) -> Blob:
+    mask = np.zeros_like(parts[0].mask)
+    for b in parts:
+        mask |= b.mask
+    ys, xs = np.nonzero(mask)
+    return Blob(mask=mask, centroid=(float(xs.mean()), float(ys.mean())), area=int(mask.sum()))
+
+
+def _natural_columns(blobs: list[Blob]) -> list[list[Blob]]:
+    """Делит пятна на столбцы по ЕСТЕСТВЕННЫМ промежуткам по X, без заданного заранее
+    числа столбцов. Раньше (`_split_into_columns`) кадр принудительно резался на
+    `cols` частей по самым большим промежуткам — одна пылинка в углу кадра съедала
+    один из разрезов, и два соседних животных сливались в одно (фото LbL WGA 1h,
+    сессия 7), а на фото с 3 животными при cols=5 одно животное дробилось на три."""
+    if not blobs:
+        return []
+    ordered = sorted(blobs, key=lambda b: b.centroid[0])
+    widths = [_blob_x_width(b) for b in ordered]
+    gap_limit = max(COLUMN_GAP_MIN_PX, COLUMN_GAP_WIDTH_FRACTION * float(np.median(widths)))
+    columns: list[list[Blob]] = [[ordered[0]]]
+    for prev, cur in zip(ordered, ordered[1:]):
+        if cur.centroid[0] - prev.centroid[0] > gap_limit:
+            columns.append([cur])
+        else:
+            columns[-1].append(cur)
+    return columns
+
+
+def _merge_fragments_in_column(column: list[Blob]) -> list[Blob]:
+    """Склеивает куски одного среза, лежащие на одной высоте (срез разрезан тёмной
+    полоской/пузырём на два пятна — раньше получалось два «среза» вместо одного)."""
+    merged: list[list[Blob]] = []
+    for blob in sorted(column, key=lambda b: b.centroid[1]):
+        y0, y1 = _blob_y_range(blob)
+        if merged:
+            last = merged[-1]
+            ly0 = min(_blob_y_range(b)[0] for b in last)
+            ly1 = max(_blob_y_range(b)[1] for b in last)
+            overlap = min(y1, ly1) - max(y0, ly0)
+            smaller = max(1, min(y1 - y0, ly1 - ly0))
+            if overlap > SAME_SLICE_Y_OVERLAP * smaller:
+                last.append(blob)
+                continue
+        merged.append([blob])
+    return [parts[0] if len(parts) == 1 else _merge_blobs(parts) for parts in merged]
+
+
 def assign_blobs_to_grid(
     blobs: list[Blob], cols: int, rows: int | None = None
 ) -> tuple[dict[tuple[int, int], Blob], int, str | None]:
-    """Раскладывает найденные пятна по сетке (индекс животного, индекс среза).
+    """Раскладывает найденные пятна-срезы по животным (столбцы слева направо) и
+    срезам (сверху вниз).
 
-    Если `rows` не задан — число срезов на животное определяется автоматически:
-    берётся максимальное количество пятен, найденное в одном из столбцов
-    (животных обычно проще посчитать точно, т.к. они разнесены по горизонтали
-    сильнее, чем срезы одного животного по вертикали).
+    Столбцы ищутся по естественным промежуткам (`_natural_columns`), `cols` — только
+    ожидаемое число животных для проверки: если нашлось другое число, это не
+    исправляется «насильно», а показывается предупреждение — правка на вкладке
+    проверки («Поищи здесь», переназначение маски). Столбцы-мусор (суммарная площадь
+    сильно меньше типичной) отбрасываются, тоже с предупреждением. Число срезов у
+    каждого животного своё (сколько нашлось); `rows`, если задан, обрезает лишние.
 
-    Возвращает (словарь {(animal_index, slice_index): Blob}, итоговое число строк
-    сетки, текст предупреждения либо None).
+    Возвращает ({(животное, срез): Blob}, максимальное число срезов у животного,
+    текст предупреждения либо None). Пустых ячеек-заглушек больше нет — недостающий
+    срез добавляется кнопкой «Поищи здесь» или «Новый срез кистью».
     """
-    columns = _split_into_columns(blobs, cols)
-    counts = [len(c) for c in columns]
+    columns = [_merge_fragments_in_column(c) for c in _natural_columns(blobs)]
+    notes: list[str] = []
 
-    if rows is None:
-        resolved_rows = max(counts) if counts else 1
-    else:
-        resolved_rows = rows
+    if columns:
+        totals = [sum(b.area for b in c) for c in columns]
+        typical = float(np.median(totals))
+        kept = [c for c, t in zip(columns, totals) if t >= JUNK_COLUMN_AREA_FRACTION * typical]
+        dropped = len(columns) - len(kept)
+        # больше столбцов, чем животных: лишние — самые «лёгкие» по площади
+        if len(kept) > cols:
+            by_weight = sorted(kept, key=lambda c: sum(b.area for b in c), reverse=True)[:cols]
+            dropped += len(kept) - cols
+            kept = [c for c in kept if any(c is k for k in by_weight)]
+        if dropped:
+            notes.append(
+                f"Отброшено как мусор (мелкие пятна в стороне от животных): {dropped} шт. "
+                "Если это был срез — добавьте его кнопкой «Поищи здесь»."
+            )
+        columns = kept
 
-    warning: str | None = None
-    if rows is None:
-        if counts and len(set(counts)) > 1:
-            details = ", ".join(f"животное {i + 1}: {c}" for i, c in enumerate(counts))
-            warning = (
-                f"На фото найдено разное число срезов у разных животных ({details}). "
-                f"Взято максимальное ({resolved_rows}) — недостающие ячейки нужно доразметить вручную."
-            )
-    else:
-        expected = rows * cols
-        if len(blobs) != expected:
-            warning = (
-                f"Найдено пятен: {len(blobs)}, ожидалось по настройке сетки: {expected} "
-                f"({cols} животных x {rows} срезов). Проверьте разметку на этом фото вручную."
-            )
+    if len(columns) != cols:
+        notes.append(
+            f"Найдено животных: {len(columns)}, а в настройках группы указано {cols}. "
+            "Проверьте раскладку: неправильно отнесённую маску можно переназначить, "
+            "пропущенный срез — найти кнопкой «Поищи здесь»."
+        )
 
     assignment: dict[tuple[int, int], Blob] = {}
-    for animal_index, column_blobs in enumerate(columns):
-        if animal_index >= cols:
-            break
-        column_sorted = sorted(column_blobs, key=lambda b: b.centroid[1])
-        for slice_index, blob in enumerate(column_sorted):
-            if slice_index >= resolved_rows:
-                break
+    max_rows = 0
+    for animal_index, column in enumerate(columns):
+        ordered = sorted(column, key=lambda b: b.centroid[1])
+        if rows is not None:
+            ordered = ordered[:rows]
+        max_rows = max(max_rows, len(ordered))
+        for slice_index, blob in enumerate(ordered):
             assignment[(animal_index, slice_index)] = blob
 
-    return assignment, resolved_rows, warning
+    counts = [len(c) for c in columns]
+    if rows is None and counts and len(set(counts)) > 1:
+        details = ", ".join(f"животное {i + 1}: {c}" for i, c in enumerate(counts))
+        notes.append(f"Разное число срезов у животных ({details}) — проверьте, не пропущен ли срез.")
+
+    return assignment, max(max_rows, 1), ("\n".join(notes) if notes else None)
 
 
 def _split_by_largest_y_gap(blobs: list[Blob]) -> tuple[list[Blob], list[Blob]]:
@@ -460,6 +544,19 @@ def build_masks_for_image(
         assignment, resolved_rows, warning = assign_blobs_to_grid(blobs, group.cols, group.rows)
 
     masks: list[SpecimenMask] = []
+    if group.mode == MaskMode.WHOLE_BLOB:
+        # срезы: маска только там, где пятно реально нашлось (у каждого животного своё
+        # число срезов). Рост до тусклого края не должен заходить на соседей — ни на
+        # другие срезы, ни на отброшенный мусор; куски склеенного среза (они уже внутри
+        # его маски) соседями не считаются
+        assigned = list(assignment.values())
+        leftovers = [b for b in blobs if not any((b.mask & a.mask).any() for a in assigned)]
+        for (animal_index, slice_index), blob in sorted(assignment.items()):
+            others = [b for b in assigned if b is not blob] + leftovers
+            grown = grow_blob_to_soft_edge(image, blob, others)
+            masks.append(SpecimenMask(animal_index=animal_index, slice_index=slice_index, mask=grown.mask))
+        return masks, warning
+
     poorly_elongated_animals: list[int] = []
     for animal_index in range(group.cols):
         for slice_index in range(resolved_rows):
@@ -470,16 +567,6 @@ def build_masks_for_image(
                         animal_index=animal_index,
                         slice_index=slice_index,
                         mask=np.zeros(image.shape[:2], dtype=bool),
-                    )
-                )
-            elif group.mode == MaskMode.WHOLE_BLOB:
-                other_blobs = [b for b in blobs if b is not blob]
-                grown = grow_blob_to_soft_edge(image, blob, other_blobs)
-                masks.append(
-                    SpecimenMask(
-                        animal_index=animal_index,
-                        slice_index=slice_index,
-                        mask=grown.mask,
                     )
                 )
             else:  # ROSTRAL_CUT
@@ -612,3 +699,90 @@ def apply_polygon_edit(
     covered = np.unique(labels[old_poly_mask & old_mask])
     keep = old_mask & ~np.isin(labels, covered)
     return new_mask | keep
+
+
+# --- «Поищи здесь»: поиск пропущенного среза вокруг клика (сессия 7) ---
+# окно вокруг клика, в котором ищется пятно и оценивается локальный фон (px)
+FIND_HERE_WINDOW_PX = 120
+# пороги "фон + k·разброс" от строгого к мягкому — берётся первый, при котором под
+# кликом нашлось пятно нормального размера. Тусклый срез, который не прошёл общий
+# строгий порог (4σ по всему кадру), обычно находится на 2–3σ от ЛОКАЛЬНОГО фона
+FIND_HERE_SIGMAS = (4.0, 3.0, 2.5, 2.0, 1.5, 1.0)
+# клик может прийтись чуть мимо тусклого пятна — ищем ближайшее в этом радиусе
+FIND_HERE_SNAP_PX = 25
+FIND_HERE_MIN_AREA_PX = 120
+
+
+def find_blob_at(
+    image: np.ndarray,
+    point: tuple[float, float],
+    existing: list[np.ndarray] = (),
+) -> np.ndarray | None:
+    """Ищет пятно (срез) вокруг точки клика и возвращает его маску (bool, размер кадра)
+    или None, если ничего похожего на срез рядом нет.
+
+    Фон и разброс считаются ЛОКАЛЬНО (в окне вокруг клика, без уже размеченных масок) —
+    у края кадра фон темнее/светлее, и общий порог по всему кадру тусклый срез
+    пропускает. Порог опускается ступенями (`FIND_HERE_SIGMAS`), пока под кликом не
+    найдётся пятно; уже размеченные маски (`existing`) в новое пятно не входят. Дальше —
+    тот же ограниченный рост до тусклого края, что и у автоматических масок.
+    """
+    h, w = image.shape[:2]
+    cx, cy = int(round(point[0])), int(round(point[1]))
+    if not (0 <= cx < w and 0 <= cy < h):
+        return None
+    r = FIND_HERE_WINDOW_PX
+    x0, x1 = max(0, cx - r), min(w, cx + r + 1)
+    y0, y1 = max(0, cy - r), min(h, cy + r + 1)
+
+    blurred = cv2.GaussianBlur(image.astype(np.float32), (5, 5), 0)
+    win = blurred[y0:y1, x0:x1]
+    taken = np.zeros((y1 - y0, x1 - x0), dtype=bool)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    for m in existing:
+        taken |= cv2.dilate(m[y0:y1, x0:x1].astype(np.uint8), kernel) > 0
+
+    free = win[~taken]
+    if free.size < 100:
+        return None
+    median = float(np.median(free))
+    mad = float(np.median(np.abs(free - median)))
+    robust_std = 1.4826 * mad if mad > 0 else float(np.std(free)) or 1.0
+
+    local_click = (cx - x0, cy - y0)
+    yy, xx = np.ogrid[: y1 - y0, : x1 - x0]
+    near_click = (xx - local_click[0]) ** 2 + (yy - local_click[1]) ** 2 <= FIND_HERE_SNAP_PX ** 2
+
+    for k in FIND_HERE_SIGMAS:
+        binary = _clean_binary((win >= median + k * robust_std) & ~taken) > 0
+        n, labels = cv2.connectedComponents(binary.astype(np.uint8), connectivity=8)
+        if n <= 1:
+            continue
+        label = labels[local_click[1], local_click[0]]
+        if label == 0:
+            # клик мимо — ближайшая к клику компонента в радиусе прилипания
+            candidates = np.unique(labels[near_click & (labels > 0)])
+            if candidates.size == 0:
+                continue
+            ys, xs = np.nonzero(np.isin(labels, candidates))
+            d2 = (xs - local_click[0]) ** 2 + (ys - local_click[1]) ** 2
+            label = labels[ys[np.argmin(d2)], xs[np.argmin(d2)]]
+        comp = labels == label
+        area = int(comp.sum())
+        if area < FIND_HERE_MIN_AREA_PX:
+            continue
+        cys, cxs = np.nonzero(comp)
+        touches_border = (
+            (cxs.min() == 0 and x0 > 0) or (cys.min() == 0 and y0 > 0)
+            or (cxs.max() == comp.shape[1] - 1 and x1 < w) or (cys.max() == comp.shape[0] - 1 and y1 < h)
+        )
+        if touches_border:
+            # пятно упирается в край окна — порог уже «протёк» в фон; мягче не будет лучше
+            break
+        full = np.zeros((h, w), dtype=bool)
+        full[y0:y1, x0:x1] = comp
+        core = Blob(mask=full, centroid=(float(cxs.mean() + x0), float(cys.mean() + y0)), area=area)
+        others = [Blob(mask=m, centroid=(0.0, 0.0), area=int(m.sum())) for m in existing if m.any()]
+        grown = grow_blob_to_soft_edge(image, core, others)
+        return grown.mask
+    return None

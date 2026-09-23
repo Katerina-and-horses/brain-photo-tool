@@ -1,6 +1,8 @@
 """Виджет для просмотра и ручной правки масок поверх фото."""
 from __future__ import annotations
 
+import dataclasses
+
 import cv2
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
@@ -15,6 +17,7 @@ HANDLE_HIT_RADIUS_PX = 14  # в экранных пикселях — попад
 EDGE_HIT_RADIUS_PX = 10    # попадание по ребру полигона (двойной клик — добавить точку)
 MIN_ZOOM = 1.0             # 1.0 = фото вписано целиком (как раньше, до зума)
 MAX_ZOOM = 8.0
+UNDO_LIMIT = 60            # сколько последних правок на кадр помнит Ctrl+Z
 
 
 class MaskCanvas(QWidget):
@@ -23,6 +26,11 @@ class MaskCanvas(QWidget):
     панораму для рассмотрения деталей вблизи."""
 
     maskEdited = Signal()
+    # активная маска сменилась кликом по фото — боковой список подсвечивает её
+    activeChanged = Signal()
+    # клик в режиме «Поищи здесь» — координаты на изображении; поиск делает ReviewTab
+    # (ему нужен исходный кадр, а у холста только картинка для показа)
+    findHereRequested = Signal(float, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -43,6 +51,13 @@ class MaskCanvas(QWidget):
         # перетаскиванием вершин полигона, а не закрашиванием. Пока включён, кисть
         # не рисует (мышь целиком уходит на работу с точками).
         self._point_mode_enabled = False
+        # режим «Поищи здесь»: следующий левый клик по фото — запрос поиска среза
+        self._find_here_mode = False
+        # история правок текущего кадра (список ShotReview.undo_stack, см. set_shot)
+        self._undo_stack: list = []
+        # маска, созданная кнопкой «Новый срез кистью» и ещё не нарисованная — после
+        # первого мазка ReviewTab ставит её на место по высоте
+        self.pending_new_mask: SpecimenMask | None = None
 
         self._draw_rect: QRectF | None = None
         self._scale = 1.0
@@ -74,16 +89,20 @@ class MaskCanvas(QWidget):
 
     # ---------- публичный API ----------
 
-    def set_shot(self, image_u8: np.ndarray, masks: list[SpecimenMask]) -> None:
+    def set_shot(
+        self, image_u8: np.ndarray, masks: list[SpecimenMask], undo_stack: list | None = None,
+        keep_view: bool = False,
+    ) -> None:
+        same_frame = self.image_u8 is not None and self.image_u8.shape == image_u8.shape
         self.image_u8 = image_u8
         self.masks = masks
-        if masks:
-            self.active_key = (masks[0].animal_index, masks[0].slice_index)
-        else:
-            self.active_key = None
-        # новое фото — старый зум/пан почти наверняка не туда указывает
-        self._zoom = 1.0
-        self._pan_offset = QPointF(0.0, 0.0)
+        self._undo_stack = undo_stack if undo_stack is not None else []
+        self.pending_new_mask = None
+        if self._active_mask() is None or not keep_view:
+            self.active_key = (masks[0].animal_index, masks[0].slice_index) if masks else None
+        if not (keep_view and same_frame):
+            # новое фото — старый зум/пан почти наверняка не туда указывает
+            self.reset_view()
         if self._point_mode_enabled:
             self._ensure_all_polygons()
         self.update()
@@ -91,6 +110,61 @@ class MaskCanvas(QWidget):
     def set_active_mask(self, animal_index: int, slice_index: int) -> None:
         self.active_key = (animal_index, slice_index)
         self.update()
+
+    def active_mask(self) -> SpecimenMask | None:
+        return self._active_mask()
+
+    def reset_view(self) -> None:
+        """«Вернуть общий вид» — всё фото целиком в окне, без зума и сдвига."""
+        self._zoom = 1.0
+        self._pan_offset = QPointF(0.0, 0.0)
+        self.update()
+
+    def set_find_here_mode(self, enabled: bool) -> None:
+        self._find_here_mode = bool(enabled)
+        self.setCursor(Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    # ---------- отмена (Ctrl+Z) ----------
+
+    def _snapshot(self) -> tuple:
+        # маски копируются объектами: номера/«принято» меняются на месте (editing.py,
+        # accept_all), а сами растры — нет (любая правка присваивает НОВЫЙ массив),
+        # поэтому массивы можно не копировать — снимок дешёвый
+        copies = [
+            dataclasses.replace(m, polygon=list(m.polygon) if m.polygon else None)
+            for m in self.masks
+        ]
+        return copies, self.active_key
+
+    def push_undo(self) -> None:
+        """Запомнить текущее состояние масок кадра ПЕРЕД правкой."""
+        self._undo_stack.append(self._snapshot())
+        del self._undo_stack[:-UNDO_LIMIT]
+
+    def can_undo(self) -> bool:
+        return bool(self._undo_stack)
+
+    def undo(self) -> bool:
+        if not self._undo_stack:
+            return False
+        copies, active_key = self._undo_stack.pop()
+        # на место — тот же список, что и ShotReview.masks; копии копий, чтобы снимок в
+        # истории не менялся от последующих правок
+        self.masks[:] = [
+            dataclasses.replace(m, polygon=list(m.polygon) if m.polygon else None) for m in copies
+        ]
+        self.active_key = active_key
+        self._cancel_drags()
+        self.maskEdited.emit()
+        self.update()
+        return True
+
+    def _cancel_drags(self) -> None:
+        self._dragging_brush = False
+        self._dragging_handle = None
+        self._dragging_polygon_vertex = None
+        self._drag_polygon_before = None
 
     def set_erase_enabled(self, enabled: bool) -> None:
         self._erase_toggle = bool(enabled)
@@ -129,11 +203,13 @@ class MaskCanvas(QWidget):
             self._ensure_polygon(m)
 
     def accept_all(self) -> None:
+        if any(not m.accepted for m in self.masks):
+            self.push_undo()
         for m in self.masks:
             m.accepted = True
         self.update()
 
-    def _mask_at_point(self, img_pt: tuple[float, float]) -> SpecimenMask | None:
+    def mask_at_point(self, img_pt: tuple[float, float]) -> SpecimenMask | None:
         """Первая маска (в порядке self.masks), чей растр покрывает эту точку
         изображения — используется, чтобы клик по маске выбирал её активной."""
         x, y = int(round(img_pt[0])), int(round(img_pt[1]))
@@ -255,13 +331,13 @@ class MaskCanvas(QWidget):
         """Показывать ли круг кисти под курсором — только там, где клик реально
         рисует кистью: вне режима точек, либо в режиме точек у активной маски без
         контура (пустая ячейка, см. mousePressEvent)."""
-        if self._cursor_screen is None or self._panning:
+        if self._cursor_screen is None or self._panning or self._find_here_mode:
             return False
         if self._dragging_handle is not None or self._dragging_polygon_vertex is not None:
             return False
         if self._screen_to_image(self._cursor_screen) is None:
             return False
-        if not self._point_mode_enabled:
+        if not self._point_mode_enabled or self._erase_toggle:
             return True
         active = self._active_mask()
         return active is not None and active.polygon is None
@@ -395,14 +471,51 @@ class MaskCanvas(QWidget):
 
     # ---------- взаимодействие мышью ----------
 
+    def _start_pan(self, event) -> None:
+        self._panning = True
+        self._pan_last_screen = event.position()
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        self.update()
+
+    def _set_active(self, m: SpecimenMask) -> None:
+        key = (m.animal_index, m.slice_index)
+        if key != self.active_key:
+            self.active_key = key
+            self.activeChanged.emit()
+
     def mousePressEvent(self, event) -> None:  # noqa: N802
+        buttons = event.buttons()
+        both = (buttons & Qt.MouseButton.LeftButton) and (buttons & Qt.MouseButton.RightButton)
         if event.button() == Qt.MouseButton.MiddleButton:
-            self._panning = True
-            self._pan_last_screen = event.position()
+            self._start_pan(event)
+            return
+        if both:
+            # обе кнопки мыши сразу — сдвиг картинки. Первая из двух кнопок уже успела
+            # начать мазок кистью (или тянуть точку) — откатываем его, как будто его
+            # не было, иначе каждое перемещение оставляло бы кляксу в маске
+            if self._dragging_brush or self._dragging_polygon_vertex is not None or self._dragging_handle is not None:
+                self.undo()
+            self._cancel_drags()
+            self._start_pan(event)
             return
 
         img_pt = self._screen_to_image(event.position())
         if img_pt is None:
+            return
+
+        if self._find_here_mode:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.findHereRequested.emit(float(img_pt[0]), float(img_pt[1]))
+            return
+
+        # ластик важнее режима точек: включённый ластик должен стирать с ПЕРВОГО клика
+        # по маске (жалоба сессии 7: «первый тык просто выбирает, хотя ластик включён» —
+        # в режиме точек клик по маске мимо вершины не делал ничего)
+        if self._erase_toggle:
+            hit_mask = self.mask_at_point(img_pt)
+            if hit_mask is not None:
+                self._set_active(hit_mask)
+            self._begin_brush(img_pt, erase=True)
             return
 
         # режим точек полностью забирает мышь себе — кисть в этом режиме не рисует
@@ -414,10 +527,12 @@ class MaskCanvas(QWidget):
             hit = self._hit_test_polygon_vertex_any(img_pt)
             if hit is not None:
                 m, idx = hit
-                self.active_key = (m.animal_index, m.slice_index)
+                self._set_active(m)
                 if event.button() == Qt.MouseButton.RightButton:
                     if len(m.polygon) > 3:
+                        self.push_undo()
                         old_polygon = list(m.polygon)
+                        m.polygon = list(m.polygon)
                         del m.polygon[idx]
                         m.mask = apply_polygon_edit(m.mask, old_polygon, m.polygon)
                         m.cut_line = None
@@ -426,6 +541,7 @@ class MaskCanvas(QWidget):
                         self.maskEdited.emit()
                     self.update()
                     return
+                self.push_undo()
                 self._dragging_polygon_vertex = (m, idx)
                 # контур ДО перетаскивания — нужен на отпускании, чтобы понять, какую
                 # область маски он представлял (см. apply_polygon_edit)
@@ -441,11 +557,15 @@ class MaskCanvas(QWidget):
             # без этой ветки такую маску было вообще невозможно нарисовать в режиме
             # точек (клик молча ничего не делал). Кисть остаётся способом создать
             # первый мазок; контур для него построится сам при следующей отрисовке
+            # клик внутри другой маски мимо вершин — просто выбрать её
+            hit_mask = self.mask_at_point(img_pt)
+            if hit_mask is not None:
+                self._set_active(hit_mask)
+                self.update()
+                return
             active = self._active_mask()
             if active is not None and active.polygon is None:
-                self._dragging_brush = True
-                self.erase_mode = self._erase_toggle or event.button() == Qt.MouseButton.RightButton
-                self._paint_brush(img_pt)
+                self._begin_brush(img_pt, erase=event.button() == Qt.MouseButton.RightButton)
             return
 
         # ручки видны у всех животных сразу (не только у активного) — ищем среди всех,
@@ -458,8 +578,9 @@ class MaskCanvas(QWidget):
                 dx = (p[0] - img_pt[0]) * self._scale
                 dy = (p[1] - img_pt[1]) * self._scale
                 if (dx * dx + dy * dy) ** 0.5 <= HANDLE_HIT_RADIUS_PX:
+                    self.push_undo()
                     self._dragging_handle = (m, idx)
-                    self.active_key = (m.animal_index, m.slice_index)
+                    self._set_active(m)
                     self.update()
                     return
 
@@ -470,15 +591,21 @@ class MaskCanvas(QWidget):
         # фото по сравнению с пайплайном "нос", где клик по линии сам переключает
         # активное животное. Клик по пустому фону активное животное не меняет —
         # так по-прежнему можно дорисовывать маску наружу за её текущий край
-        hit_mask = self._mask_at_point(img_pt)
+        hit_mask = self.mask_at_point(img_pt)
         if hit_mask is not None:
-            self.active_key = (hit_mask.animal_index, hit_mask.slice_index)
+            self._set_active(hit_mask)
 
-        self._dragging_brush = True
         # правая кнопка стирает всегда; левая — стирает, только если включён чекбокс
         # "Ластик" (раньше чекбокс ни на что не влиял — это и была жалоба "ластик не
         # работает": включаешь чекбокс, жмёшь левой, а получаешь рисование)
-        self.erase_mode = self._erase_toggle or event.button() == Qt.MouseButton.RightButton
+        self._begin_brush(img_pt, erase=event.button() == Qt.MouseButton.RightButton)
+
+    def _begin_brush(self, img_pt: tuple[float, float], erase: bool) -> None:
+        if self._active_mask() is None:
+            return
+        self.push_undo()
+        self._dragging_brush = True
+        self.erase_mode = self._erase_toggle or erase
         self._paint_brush(img_pt)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
@@ -518,9 +645,14 @@ class MaskCanvas(QWidget):
             self._paint_brush(img_pt)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
-        if event.button() == Qt.MouseButton.MiddleButton:
+        if self._panning:
+            # сдвиг заканчивается, когда отпущена любая из кнопок, которыми он начат;
+            # оставшаяся зажатой кнопка не должна тут же начать рисовать
             self._panning = False
             self._pan_last_screen = None
+            self.setCursor(Qt.CursorShape.CrossCursor if self._find_here_mode else Qt.CursorShape.ArrowCursor)
+            self._cancel_drags()
+            self.update()
             return
         if self._dragging_polygon_vertex is not None:
             m, _ = self._dragging_polygon_vertex
@@ -576,6 +708,7 @@ class MaskCanvas(QWidget):
         if hit is None:
             return
         m, insert_at = hit
+        self.push_undo()
         old_polygon = list(m.polygon)
         polygon = list(m.polygon)
         polygon.insert(insert_at, img_pt)
@@ -584,7 +717,7 @@ class MaskCanvas(QWidget):
         m.cut_line = None
         m.source_blob = None
         m.accepted = False
-        self.active_key = (m.animal_index, m.slice_index)
+        self._set_active(m)
         self.maskEdited.emit()
         self.update()
 

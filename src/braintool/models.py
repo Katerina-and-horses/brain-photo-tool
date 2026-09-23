@@ -48,6 +48,9 @@ class Shot:
     group: GroupConfig
     shot_key: str                 # имя без части exp<число>, идентифицирует кадр
     exposure_files: dict[int, Path] = field(default_factory=dict)  # exposure_ms -> путь
+    # выдержка, на которой показан кадр и найдены маски (с сессии 7 — вторая по длине
+    # незасвеченная, можно сменить вручную на вкладке проверки). Анализ яркости идёт
+    # на ОБЩЕЙ для всех кадров выдержке, выбранной на вкладке результатов
     chosen_exposure: int | None = None
 
     @property
@@ -89,6 +92,9 @@ class ShotReview:
     display_image: np.ndarray     # изображение с растяжкой контраста, uint8, для показа
     masks: list[SpecimenMask] = field(default_factory=list)
     warning: str | None = None    # напр. "найдено 8 пятен вместо 10 — проверьте вручную"
+    # история для Ctrl+Z (снимки масок до каждой правки, см. MaskCanvas.push_undo) —
+    # своя у каждого кадра, чтобы отмена не перескакивала на другое фото
+    undo_stack: list = field(default_factory=list, repr=False, compare=False)
 
 
 @dataclass
