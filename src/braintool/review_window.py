@@ -104,7 +104,7 @@ class ProjectTab(QWidget):
 
         # продолжить прошлую работу — разметка сохраняется в файл (сессия 7)
         resume_row = QHBoxLayout()
-        open_btn = QPushButton("📂 Открыть сохранённую разметку…")
+        open_btn = QPushButton("Открыть сохранённую разметку…")
         open_btn.setMinimumHeight(32)
         if on_open_markup is not None:
             open_btn.clicked.connect(on_open_markup)
@@ -368,7 +368,7 @@ class ReviewTab(QWidget):
 
         # --- добавить (только срезы: у черепов маска на животное одна) ---
         box, lay = _section("Добавить пропущенное")
-        self.find_here_btn = QPushButton("🔍 Поищи здесь")
+        self.find_here_btn = QPushButton("Поищи здесь")
         self.find_here_btn.setCheckable(True)
         self.find_here_btn.setToolTip(
             "Включите и щёлкните по фото там, где срез не нашёлся — программа сама найдёт "
@@ -376,7 +376,11 @@ class ReviewTab(QWidget):
         )
         self.find_here_btn.toggled.connect(self._toggle_find_here)
         lay.addWidget(self.find_here_btn)
-        self.new_slice_btn = QPushButton("✏ Новый срез кистью (к выбранному животному)")
+        self.new_slice_btn = QPushButton("✏ Новый срез кистью")
+        self.new_slice_btn.setToolTip(
+            "Нарисовать кистью срез, которого программа не нашла; он добавится к животному "
+            "выбранной сейчас маски"
+        )
         self.new_slice_btn.clicked.connect(self._new_slice_by_brush)
         lay.addWidget(self.new_slice_btn)
         side_layout.addWidget(box)
@@ -409,6 +413,11 @@ class ReviewTab(QWidget):
         # --- выдержка ---
         box, lay = _section("Выдержка, на которой ищутся маски")
         self.exposure_combo = QComboBox()
+        # не шире панели: иначе длинный пункт раздувает всю панель за правый край
+        self.exposure_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.exposure_combo.setMinimumContentsLength(12)
         self.exposure_combo.activated.connect(self._on_exposure_chosen)
         lay.addWidget(self.exposure_combo)
         note = QLabel(
@@ -419,7 +428,11 @@ class ReviewTab(QWidget):
         note.setWordWrap(True)
         note.setStyleSheet("color: #666666;")
         lay.addWidget(note)
-        recompute_btn = QPushButton("Пересчитать маски автоматически заново")
+        recompute_btn = QPushButton("Найти маски заново")
+        recompute_btn.setToolTip(
+            "Заново найти все маски этого фото автоматически на выбранной выдержке "
+            "(ручные правки этого фото пропадут, отменяется Ctrl+Z)"
+        )
         recompute_btn.clicked.connect(self._recompute_current)
         lay.addWidget(recompute_btn)
         side_layout.addWidget(box)
@@ -437,16 +450,19 @@ class ReviewTab(QWidget):
         scroll.setWidget(side)
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setMinimumWidth(330)
+        # ширина панели: весь текст помещается без обрезки справа (жалоба сессии 7 —
+        # содержимое шире окна прокрутки уходило за правый край)
+        scroll.setMinimumWidth(340)
         splitter.addWidget(scroll)
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 1)
+        splitter.setSizes([1000, 400])
 
         # --- навигация: «Принять» рядом с «Далее», крупно (раньше терялась посередине) ---
         nav_row = QHBoxLayout()
         self.prev_btn = QPushButton("◀ Назад")
         self.prev_btn.clicked.connect(self._go_prev)
-        self.save_btn = QPushButton("💾 Сохранить разметку")
+        self.save_btn = QPushButton("Сохранить разметку")
         self.save_btn.setToolTip("Сохранить всю разметку в файл, чтобы продолжить позже (Ctrl+S)")
         self.save_btn.clicked.connect(lambda: self._on_save())
         self.accept_btn = QPushButton("✔ Принять всё на этом фото")
@@ -603,7 +619,7 @@ class ReviewTab(QWidget):
             "background-color: #1565c0; color: white; font-weight: bold;" if enabled else ""
         )
         self.find_here_btn.setText(
-            "🔍 Щёлкните по фото, где пропущен срез (Esc — выйти)" if enabled else "🔍 Поищи здесь"
+            "Щёлкните по фото, где пропущен срез (Esc — выйти)" if enabled else "Поищи здесь"
         )
 
     def _find_here(self, x: float, y: float) -> None:
@@ -1232,11 +1248,13 @@ class ResultsTab(QWidget):
                 "Выбран пункт «Все выдержки» — он только для выгрузки таблицы. Для сравнения "
                 "выберите одну выдержку (рекомендуемая отмечена в списке)."
             )
-        if animal_df.empty:
-            return "Нет ни одной принятой маски на выбранной выдержке / выбранном срезе."
-        if animal_df["group"].nunique() >= 2:
-            return None
         key = self.compare_by_combo.currentData()
+        # при «по условию» группы с пустой меткой уже отброшены (_comparison_df), поэтому
+        # пустая таблица тут может значить «метки не заполнены», а не «масок нет»
+        if animal_df.empty and not (key == "condition" and not self._animal_df().empty):
+            return "Нет ни одной принятой маски на выбранной выдержке / выбранном срезе."
+        if not animal_df.empty and animal_df["group"].nunique() >= 2:
+            return None
         if key == "condition":
             filled = self._animal_df()["condition"].astype(str).str.strip()
             if (filled == "").all():
@@ -1458,7 +1476,7 @@ class PipelineTabs(QTabWidget):
         box.setWindowTitle("Заменить текущую разметку?")
         box.setText(
             "На вкладке «2. Проверка масок» уже есть разметка — она будет заменена. "
-            "Если она нужна, сначала сохраните её («💾 Сохранить разметку»). Продолжить?"
+            "Если она нужна, сначала сохраните её («Сохранить разметку»). Продолжить?"
         )
         box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
         box.setDefaultButton(QMessageBox.StandardButton.Cancel)
