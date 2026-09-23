@@ -1,0 +1,61 @@
+# Сборка BrainPhotoTool.exe под Windows на серверах GitHub и публикация готового
+# zip на странице Releases — чтобы не собирать вручную (ДОКУМЕНТАЦИЯ.md, раздел 11).
+# Запускается при каждом push в master и вручную (Actions → Run workflow).
+name: Сборка для Windows
+
+on:
+  push:
+    branches: [master, session-6-docs-and-polish]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Зависимости
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: PyInstaller
+        run: pyinstaller --noconfirm BrainPhotoTool.spec
+
+      - name: Проверка запуска exe (окно живо через 25 с = не упало при старте)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist\BrainPhotoTool\BrainPhotoTool.exe" -PassThru
+          Start-Sleep -Seconds 25
+          if ($p.HasExited) { Write-Error "exe завершился при старте, код $($p.ExitCode)"; exit 1 }
+          Stop-Process -Id $p.Id -Force
+          Write-Host "exe стартует нормально"
+
+      - name: Папка для лаборатории + zip
+        shell: pwsh
+        run: |
+          # Папка с программой — латиницей: имена внутри zip с кириллицей на части
+          # систем распаковываются кракозябрами, и .bat не нашёл бы exe
+          New-Item -ItemType Directory -Force -Path "out\BrainPhotoTool" | Out-Null
+          Move-Item "dist\BrainPhotoTool" "out\BrainPhotoTool\program"
+          Copy-Item "Как пользоваться.txt" "out\BrainPhotoTool\"
+          $bat = "@echo off`r`nstart `"`" `"%~dp0program\BrainPhotoTool.exe`"`r`n"
+          [System.IO.File]::WriteAllText("out\BrainPhotoTool\Запуск программы.bat", $bat, [System.Text.Encoding]::ASCII)
+          python -c "import shutil; shutil.make_archive('BrainPhotoTool-windows', 'zip', 'out')"
+
+      - name: Публикация в Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $tag = "build-${{ github.run_number }}"
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          $notes = "Автосборка из коммита $sha. Скачайте BrainPhotoTool-windows.zip, распакуйте и дважды кликните «Запуск программы»."
+          gh release create $tag BrainPhotoTool-windows.zip --target "${{ github.sha }}" --title "BrainPhotoTool ($(Get-Date -Format 'dd.MM.yyyy'), сборка ${{ github.run_number }})" --notes $notes --latest

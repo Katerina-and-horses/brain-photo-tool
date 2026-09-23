@@ -51,7 +51,15 @@ def measure_shot(
 
 
 def rows_to_dataframe(rows: list[MeasurementRow]) -> pd.DataFrame:
+    """Таблица для показа/экспорта/статистики. Номера животного и среза здесь — С 1,
+    как их видит человек на вкладке "Проверка" ("Животное 1", "срез 1"); в моделях
+    (`MeasurementRow`, `SpecimenMask`) они по-прежнему с 0. Раньше таблица, файл
+    выгрузки и список "Только срез №N" показывали индексы с 0 — "срез №2" в
+    результатах был "срезом 3" на проверке."""
     df = pd.DataFrame([r.__dict__ for r in rows])
+    if not df.empty:
+        df["animal_index"] = df["animal_index"] + 1
+        df["slice_index"] = df["slice_index"] + 1
     if df.empty:
         df = pd.DataFrame(
             columns=[
@@ -123,4 +131,8 @@ def export_table(df: pd.DataFrame, path: Path) -> None:
     if path.suffix.lower() in (".xlsx", ".xls"):
         df.to_excel(path, index=False)
     else:
-        df.to_csv(path, index=False, encoding="utf-8-sig")
+        # разделитель ";" и "," как десятичный — не pandas-дефолт, но у Excel в
+        # русской локали запятая зарезервирована под десятичный разделитель, и
+        # с обычным CSV (",", ".") двойной клик по файлу сваливает все колонки
+        # в одну ячейку A, а числа с точкой распознаются как текст
+        df.to_csv(path, index=False, encoding="utf-8-sig", sep=";", decimal=",")

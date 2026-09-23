@@ -63,6 +63,14 @@ def _mannwhitney_exact_p(u_stat: float, n1: int, n2: int) -> float:
 # нормальное приближение (это стандартная практика и для scipy).
 _EXACT_LIMIT = 2500
 
+# Отдельный предел на n1+n2 (а не только на n1*n2): `count()` в
+# `_mannwhitney_exact_p` — рекурсия глубиной ~n1+n2 (каждый вызов уменьшает
+# n1 или n2 на 1), а не ~n1*n2. При сильно несбалансированных выборках
+# (например, n1=2, n2=1250 — n1*n2=2500 ровно на пороге _EXACT_LIMIT) глубина
+# рекурсии превышает лимит Python (по умолчанию 1000) и падает RecursionError.
+# Порог взят с запасом от лимита рекурсии.
+_EXACT_MAX_TOTAL_N = 500
+
 
 def mannwhitneyu(x: list[float], y: list[float]) -> tuple[float, float]:
     """Двусторонний критерий Манна-Уитни. Возвращает (U1, p-value).
@@ -79,7 +87,7 @@ def mannwhitneyu(x: list[float], y: list[float]) -> tuple[float, float]:
     counts = Counter(combined)
     has_ties = any(c > 1 for c in counts.values())
 
-    if not has_ties and n1 * n2 <= _EXACT_LIMIT:
+    if not has_ties and n1 * n2 <= _EXACT_LIMIT and n1 + n2 <= _EXACT_MAX_TOTAL_N:
         p = _mannwhitney_exact_p(u1, n1, n2)
     else:
         big_n = n1 + n2

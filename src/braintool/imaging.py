@@ -25,7 +25,8 @@ def load_image(path: Path) -> np.ndarray:
     if path.suffix.lower() in (".tif", ".tiff"):
         arr = tifffile.imread(str(path))
     else:
-        arr = np.array(Image.open(path))
+        with Image.open(path) as img:
+            arr = np.array(img)
     if arr.ndim == 3:
         # цветное фото — берём яркость (на случай обычных RGB-снимков, не флуоресценции)
         arr = np.mean(arr[..., :3], axis=-1).astype(arr.dtype)
