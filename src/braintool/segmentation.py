@@ -555,8 +555,9 @@ def mask_to_polygon(mask: np.ndarray, max_points: int = POLYGON_MAX_POINTS) -> l
     человек подтягивает уже готовый контур, а не обводит форму с нуля.
 
     Возвращает None, если в маске нет ни одного закрашенного пикселя (нечего
-    обводить). Если у маски несколько несвязных областей — берётся самая большая
-    по площади (остальные, скорее всего, шум/блик, а не то, что хотели выделить).
+    обводить). Если у маски несколько несвязных областей — обводится самая большая
+    по площади; остальные при правке точками сохраняются как есть (см.
+    `apply_polygon_edit`), но точками не редактируются.
     `approxPolyDP` упрощает контур со всё бОльшим эпсилон, пока число вершин не
     уложится в `max_points`.
     """
@@ -587,3 +588,27 @@ def polygon_to_mask(polygon: list[tuple[float, float]], shape: tuple[int, int]) 
         pts = np.array([[int(round(x)), int(round(y))] for x, y in polygon], dtype=np.int32)
         cv2.fillPoly(out, [pts], 1)
     return out.astype(bool)
+
+
+def apply_polygon_edit(
+    old_mask: np.ndarray,
+    old_polygon: list[tuple[float, float]],
+    new_polygon: list[tuple[float, float]],
+) -> np.ndarray:
+    """Растеризует отредактированный полигон, НЕ теряя остальные несвязные области
+    маски. `mask_to_polygon` обводит только самую большую область — если до правки
+    точками в маске было несколько отдельных кусков (например, дорисованных кистью),
+    простая замена `mask = polygon_to_mask(new_polygon)` молча выкидывала бы все
+    остальные. Сохраняются связные компоненты `old_mask`, которые НЕ пересекаются
+    со старым полигоном (то есть не та область, которую полигон и представлял);
+    компонента под полигоном целиком заменяется новым контуром."""
+    new_mask = polygon_to_mask(new_polygon, old_mask.shape)
+    if not old_mask.any():
+        return new_mask
+    n_labels, labels = cv2.connectedComponents(old_mask.astype(np.uint8), connectivity=8)
+    if n_labels <= 2:  # фон + одна область — сохранять нечего
+        return new_mask
+    old_poly_mask = polygon_to_mask(old_polygon, old_mask.shape)
+    covered = np.unique(labels[old_poly_mask & old_mask])
+    keep = old_mask & ~np.isin(labels, covered)
+    return new_mask | keep

@@ -51,7 +51,15 @@ def measure_shot(
 
 
 def rows_to_dataframe(rows: list[MeasurementRow]) -> pd.DataFrame:
+    """Таблица для показа/экспорта/статистики. Номера животного и среза здесь — С 1,
+    как их видит человек на вкладке "Проверка" ("Животное 1", "срез 1"); в моделях
+    (`MeasurementRow`, `SpecimenMask`) они по-прежнему с 0. Раньше таблица, файл
+    выгрузки и список "Только срез №N" показывали индексы с 0 — "срез №2" в
+    результатах был "срезом 3" на проверке."""
     df = pd.DataFrame([r.__dict__ for r in rows])
+    if not df.empty:
+        df["animal_index"] = df["animal_index"] + 1
+        df["slice_index"] = df["slice_index"] + 1
     if df.empty:
         df = pd.DataFrame(
             columns=[
