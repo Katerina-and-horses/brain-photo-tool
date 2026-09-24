@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -186,8 +188,67 @@ def load_markup(path: Path) -> LoadedMarkup:
                         current_index=current, problems=problems)
 
 
-def autosave_path(mode: MaskMode) -> Path:
-    """Куда пишется автосохранение, если пользователь ещё не выбрал файл сам."""
-    folder = Path.home() / "BrainPhotoTool автосохранение"
-    name = "срезы" if mode == MaskMode.WHOLE_BLOB else "эпителий"
-    return folder / f"автосохранение_{name}{FILE_SUFFIX}"
+# ---------- имена файлов (сессия 8) ----------
+# Раньше диалоги сохранения всегда предлагали одно и то же имя («разметка_срезы»,
+# «результаты.xlsx»), а автосохранение было одним файлом на пайплайн — новый проект
+# молча затирал прошлый. Теперь в имени группы + дата-время, а занятое имя не
+# предлагается никогда.
+
+AUTOSAVE_DIR = Path.home() / "BrainPhotoTool автосохранение"
+AUTOSAVE_KEEP = 20  # сколько последних автосохранений на пайплайн хранить
+_BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _pipeline_word(mode: MaskMode) -> str:
+    return "срезы" if mode == MaskMode.WHOLE_BLOB else "эпителий"
+
+
+def _safe(text: str, limit: int = 60) -> str:
+    text = _BAD_CHARS.sub("_", text).strip(" .")
+    return text[:limit].rstrip(" .") or "без_названия"
+
+
+def file_stem(prefix: str, mode: MaskMode, group_names: list[str]) -> str:
+    """«разметка_срезы_<группа>[ и ещё N]_2026-09-24_14-05»."""
+    parts = [prefix, _pipeline_word(mode)]
+    if group_names:
+        first = _safe(group_names[0])
+        parts.append(first if len(group_names) == 1 else f"{first} и ещё {len(group_names) - 1}")
+    parts.append(datetime.now().strftime("%Y-%m-%d_%H-%M"))
+    return "_".join(parts)
+
+
+def unique_path(path: Path) -> Path:
+    """Тот же путь, а если файл уже есть — «имя (2).ext», «имя (3).ext»…"""
+    path = Path(path)
+    n = 2
+    candidate = path
+    while candidate.exists():
+        candidate = path.with_name(f"{path.stem} ({n}){path.suffix}")
+        n += 1
+    return candidate
+
+
+def new_autosave_path(mode: MaskMode, group_names: list[str]) -> Path:
+    """Своё автосохранение для каждого нового проекта (прошлые не затираются)."""
+    return unique_path(AUTOSAVE_DIR / (file_stem("автосохранение", mode, group_names) + FILE_SUFFIX))
+
+
+def list_autosaves(mode: MaskMode) -> list[Path]:
+    """Автосохранения пайплайна, от последнего к первому (включая старое
+    «автосохранение_срезы.bpmarkup» из сессии 7)."""
+    if not AUTOSAVE_DIR.is_dir():
+        return []
+    files = AUTOSAVE_DIR.glob(f"автосохранение_{_pipeline_word(mode)}*{FILE_SUFFIX}")
+    return sorted((p for p in files if p.is_file()), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def prune_autosaves(mode: MaskMode, keep_also: Path | None = None) -> None:
+    """Удалить старые автосохранения сверх AUTOSAVE_KEEP (текущее не трогается)."""
+    for old in list_autosaves(mode)[AUTOSAVE_KEEP:]:
+        if keep_also is not None and old == keep_also:
+            continue
+        try:
+            old.unlink()
+        except OSError:
+            pass

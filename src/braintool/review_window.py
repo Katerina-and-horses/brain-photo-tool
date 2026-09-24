@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import re
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -13,7 +14,7 @@ from PySide6.QtGui import (
     QBrush, QColor, QKeySequence, QPixmap, QShortcut, QStandardItem, QStandardItemModel,
 )
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QAbstractItemView, QFileSystemModel, QListView, QTreeView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QMessageBox,
     QPushButton, QScrollArea, QSpinBox, QSplitter, QTableView, QTableWidget,
     QTableWidgetItem, QTabWidget, QTextEdit, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
@@ -23,13 +24,17 @@ from PySide6.QtWidgets import (
 from .canvas import MaskCanvas
 from .colors import color_for_animal
 from .editing import add_mask, animal_count, delete_mask, move_mask, slices_of
+from .folders import SUBFOLDER_TITLES, data_dir_for, find_group_folders
 from .imaging import (
     MASK_SATURATION_FRACTION_LIMIT, choose_mask_exposure, contrast_stretch_to_uint8, load_image,
     mask_saturation_fraction, scan_group_folder, unsaturated_exposures,
 )
 from .measurements import export_table, measure_shot, per_animal_average, rows_to_dataframe
 from .models import GroupConfig, MaskMode, MeasurementRow, ShotReview
-from .project_io import FILE_SUFFIX, autosave_path, load_markup, save_markup
+from .project_io import (
+    FILE_SUFFIX, file_stem, list_autosaves, load_markup, new_autosave_path, prune_autosaves,
+    save_markup, unique_path,
+)
 from .segmentation import build_masks_for_image, find_blob_at
 from .stats import boxplot_png_bytes, color_for_group, compare_groups, save_boxplot
 
@@ -66,10 +71,16 @@ class ProjectTab(QWidget):
         self.mode = mode
         self._on_start_review = on_start_review
         self.groups: list[GroupConfig] = []
+        self._last_dir = ""
 
         layout = QVBoxLayout(self)
+        sub = SUBFOLDER_TITLES[mode]
         info = QLabel(
-            "Добавьте по одной папке на каждую группу животных. Для каждой папки укажите:\n"
+            f"Добавьте папки групп животных — кнопкой ниже или перетащив их мышью в это окно "
+            f"(можно несколько сразу). Внутри папки группы программа сама возьмёт подпапку "
+            f"«{sub}»; если перетащить папку всего исследования — добавятся все группы в ней. "
+            "Название группы = имя папки (поменять — двойной клик по названию).\n"
+            "Для каждой группы укажите:\n"
             "— сколько животных на одном фото (по горизонтали, слева направо);\n"
             "— контрольная это группа или опытная (для сравнения «контроль vs опыт»);\n"
             "— при желании — произвольное условие (например, дата съёмки), чтобы потом "
@@ -84,11 +95,13 @@ class ProjectTab(QWidget):
             ["Группа", "Папка", "Животных в ряд", "Контроль?", "Условие (метка)"]
         )
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        # название группы = имя папки, обычно длинное («LbL Cy7 Au NPs 7 mkl RN 1h»)
+        self.table.setColumnWidth(0, 300)
         self.table.verticalHeader().setVisible(False)
         layout.addWidget(self.table)
 
         btn_row = QHBoxLayout()
-        add_btn = QPushButton("Добавить папку с группой...")
+        add_btn = QPushButton("Добавить папки с группами...")
         add_btn.clicked.connect(self._add_group)
         remove_btn = QPushButton("Удалить выбранную группу")
         remove_btn.clicked.connect(self._remove_selected)
@@ -96,6 +109,15 @@ class ProjectTab(QWidget):
         btn_row.addWidget(remove_btn)
         btn_row.addStretch(1)
         layout.addLayout(btn_row)
+
+        self.drop_hint = QLabel("Перетащите сюда папки групп или исследования ⤓")
+        self.drop_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.drop_hint.setMinimumHeight(44)
+        self._set_drop_highlight(False)
+        layout.addWidget(self.drop_hint)
+        # перетаскивание папок в любое место вкладки (таблица сама drop не принимает —
+        # событие поднимается к вкладке)
+        self.setAcceptDrops(True)
 
         start_btn = QPushButton("Начать проверку масок ▶")
         start_btn.setMinimumHeight(36)
@@ -119,13 +141,106 @@ class ProjectTab(QWidget):
         layout.addLayout(resume_row)
 
     def _add_group(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Выберите папку с фото группы")
-        if not folder:
+        # стандартный диалог Windows выбирает только одну папку — диалог Qt позволяет
+        # отметить несколько (Ctrl/Shift+клик)
+        dialog = QFileDialog(self, "Выберите папки групп (несколько — с Ctrl или Shift)")
+        dialog.setFileMode(QFileDialog.FileMode.Directory)
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        dialog.setOption(QFileDialog.Option.ShowDirsOnly, True)
+        if self._last_dir:
+            dialog.setDirectory(self._last_dir)
+        for view in dialog.findChildren(QListView) + dialog.findChildren(QTreeView):
+            view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        if not dialog.exec():
             return
-        name, ok = QInputDialog.getText(self, "Название группы", "Как назвать эту группу?", text=Path(folder).name)
-        if not ok or not name.strip():
+        folders = [Path(f) for f in dialog.selectedFiles()]
+        # selectedFiles берётся из строки имени, а Qt заполняет её не всегда (если
+        # фокус оставался в строке) — выделенное в списке надёжнее
+        picked: list[Path] = []
+        for view in dialog.findChildren(QListView) + dialog.findChildren(QTreeView):
+            # только сам список файлов (боковая панель «Места» — тоже QListView)
+            if view.objectName() not in ("listView", "treeView") or view.selectionModel() is None:
+                continue
+            # selectedRows() пуст в режиме «список»: там выделяется только 1-я колонка
+            for index in view.selectionModel().selectedIndexes():
+                if index.column() != 0:
+                    continue
+                path = index.data(QFileSystemModel.Roles.FilePathRole)
+                if path and Path(path) not in picked:
+                    picked.append(Path(path))
+        if picked:
+            folders = picked
+        # если выделили несколько, в selectedFiles бывает и сама текущая папка — лишняя
+        if len(folders) > 1:
+            current = Path(dialog.directory().absolutePath()).resolve()
+            folders = [f for f in folders if f.resolve() != current] or folders
+        self.add_folders(folders)
+
+    def add_folders(self, paths: list[Path]) -> None:
+        """Добавить группы из выбранных/перетащенных папок: в папке группы берётся
+        подпапка пайплайна, из папки исследования — все группы (`folders.py`)."""
+        if not paths:
             return
-        self._append_row(name.strip(), folder)
+        self._last_dir = str(Path(paths[0]).parent)
+        found = find_group_folders(paths, self.mode)
+        existing = {Path(self.table.item(r, 1).text()).resolve() for r in range(self.table.rowCount())}
+        names = {self.table.item(r, 0).text().strip() for r in range(self.table.rowCount())}
+        problems = list(found.problems)
+        added = 0
+        for name, folder in found.groups:
+            if folder.resolve() in existing:
+                problems.append(f"«{name}» уже есть в списке — не добавлена второй раз.")
+                continue
+            unique, n = name, 2
+            while unique in names:
+                unique, n = f"{name} ({n})", n + 1
+            names.add(unique)
+            existing.add(folder.resolve())
+            self._append_row(unique, str(folder))
+            added += 1
+        if problems:
+            QMessageBox.information(
+                self, "Добавлено групп: " + str(added), "\n".join(problems),
+            )
+
+    def _set_drop_highlight(self, on: bool) -> None:
+        color = "#2e7d32" if on else "#9e9e9e"
+        bg = "rgba(46,125,50,0.10)" if on else "transparent"
+        self.drop_hint.setStyleSheet(
+            f"QLabel {{ border: 2px dashed {color}; border-radius: 6px; color: {color}; background: {bg}; }}"
+        )
+
+    @staticmethod
+    def _dropped_folders(event) -> list[Path]:
+        mime = event.mimeData()
+        if not mime.hasUrls():
+            return []
+        return [Path(u.toLocalFile()) for u in mime.urls() if u.isLocalFile() and Path(u.toLocalFile()).is_dir()]
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        if self._dropped_folders(event):
+            self._set_drop_highlight(True)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        if self._dropped_folders(event):
+            event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802
+        self._set_drop_highlight(False)
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        self._set_drop_highlight(False)
+        folders = self._dropped_folders(event)
+        if not folders:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        # диалог с проблемами из самого dropEvent подвешивает перетаскивание в
+        # проводнике Windows до закрытия диалога — добавляем после выхода из события
+        QTimer.singleShot(0, lambda: self.add_folders(folders))
 
     def set_groups(self, groups: list[GroupConfig]) -> None:
         """Заполнить таблицу группами из загруженной разметки."""
@@ -1189,7 +1304,8 @@ class ResultsTab(QWidget):
             QMessageBox.information(self, "Пусто", "Сначала соберите таблицу — нет ни одной принятой маски.")
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Сохранить таблицу", "результаты.xlsx", "Excel (*.xlsx);;CSV (*.csv)"
+            self, "Сохранить таблицу", self._default_save_path("результаты", ".xlsx"),
+            "Excel (*.xlsx);;CSV (*.csv)",
         )
         if not path:
             return
@@ -1207,6 +1323,15 @@ class ResultsTab(QWidget):
             )
             return
         QMessageBox.information(self, "Готово", f"Таблица сохранена:\n{path}")
+
+    def _default_save_path(self, prefix: str, suffix: str) -> str:
+        """Свободное имя с группами и датой рядом с данными (раньше всегда
+        «результаты.xlsx» — следующая выгрузка затирала прошлую)."""
+        groups = list({id(r.shot.group): r.shot.group for r in self.reviews}.values())
+        if not groups:
+            return prefix + suffix
+        stem = file_stem(prefix, groups[0].mode, [g.name for g in groups])
+        return str(unique_path(data_dir_for(groups) / (stem + suffix)))
 
     def _animal_df(self) -> pd.DataFrame:
         """Таблица для статистики — ВСЕГДА агрегированная по животным (срез — не
@@ -1362,7 +1487,9 @@ class ResultsTab(QWidget):
             QMessageBox.information(self, "Сохранить график не получится", reason)
             return
         metric = self._current_metric_key()
-        path, _ = QFileDialog.getSaveFileName(self, "Сохранить график", "сравнение_групп.png", "PNG (*.png)")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить график", self._default_save_path("график", ".png"), "PNG (*.png)"
+        )
         if not path:
             return
         try:
@@ -1391,8 +1518,10 @@ class PipelineTabs(QTabWidget):
         self.mode = mode
         self.groups: list[GroupConfig] = []
         # файл, куда сохраняет «Сохранить разметку» (выбран пользователем); пока не
-        # выбран — автосохранение пишет в autosave_path(mode)
+        # выбран — автосохранение пишет в свой файл этого проекта (_autosave_file,
+        # создаётся при первом автосохранении — прошлые проекты не затираются)
         self.save_path: Path | None = None
+        self._autosave_file: Path | None = None
         self._dirty = False
 
         self.project_tab = ProjectTab(
@@ -1411,7 +1540,7 @@ class PipelineTabs(QTabWidget):
         self.addTab(self.results_tab, "3. Результаты")
         self.setTabEnabled(1, False)
         self.setTabEnabled(2, False)
-        self.project_tab.restore_btn.setEnabled(autosave_path(mode).exists())
+        self._refresh_restore_button()
 
         # страховка от сбоя/зависания: раз в минуту, если что-то менялось
         self._autosave_timer = QTimer(self)
@@ -1422,6 +1551,12 @@ class PipelineTabs(QTabWidget):
 
     def _mark_dirty(self) -> None:
         self._dirty = True
+
+    def _refresh_restore_button(self) -> None:
+        self.project_tab.restore_btn.setEnabled(bool(list_autosaves(self.mode)))
+
+    def _group_names(self) -> list[str]:
+        return [g.name for g in self.groups]
 
     def has_markup(self) -> bool:
         return bool(self.review_tab.reviews)
@@ -1436,7 +1571,14 @@ class PipelineTabs(QTabWidget):
         if not self._dirty or not self.has_markup():
             return
         try:
-            self._write(self.save_path or autosave_path(self.mode))
+            if self.save_path is not None:
+                self._write(self.save_path)
+            else:
+                if self._autosave_file is None:
+                    self._autosave_file = new_autosave_path(self.mode, self._group_names())
+                self._write(self._autosave_file)
+                prune_autosaves(self.mode, keep_also=self._autosave_file)
+                self._refresh_restore_button()
             self._dirty = False
         except Exception:  # noqa: BLE001
             pass
@@ -1445,7 +1587,14 @@ class PipelineTabs(QTabWidget):
         if not self.has_markup():
             QMessageBox.information(self, "Нечего сохранять", "Сначала начните проверку масок.")
             return
-        start = str(self.save_path) if self.save_path else f"разметка_{PIPELINE_TITLES[self.mode].lower()}{FILE_SUFFIX}"
+        # тот же проект — тот же файл; новый проект — новое имя рядом с данными
+        # (раньше всегда «разметка_срезы.bpmarkup» — следующий проект затирал прошлый)
+        if self.save_path is not None:
+            start = str(self.save_path)
+        else:
+            start = str(unique_path(
+                data_dir_for(self.groups) / (file_stem("разметка", self.mode, self._group_names()) + FILE_SUFFIX)
+            ))
         path, _ = QFileDialog.getSaveFileName(
             self, "Сохранить разметку", start, f"Разметка BrainPhotoTool (*{FILE_SUFFIX})"
         )
@@ -1475,8 +1624,9 @@ class PipelineTabs(QTabWidget):
         box = QMessageBox(self)
         box.setWindowTitle("Заменить текущую разметку?")
         box.setText(
-            "На вкладке «2. Проверка масок» уже есть разметка — она будет заменена. "
-            "Если она нужна, сначала сохраните её («Сохранить разметку»). Продолжить?"
+            "На вкладке «2. Проверка масок» уже есть разметка — она будет закрыта. "
+            "Она не потеряется: уже сохранена в свой файл (или в автосохранение — "
+            "вернуть кнопкой «Продолжить с автосохранения»). Продолжить?"
         )
         box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
         box.setDefaultButton(QMessageBox.StandardButton.Cancel)
@@ -1484,16 +1634,30 @@ class PipelineTabs(QTabWidget):
 
     def _open_markup(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "Открыть разметку", "", f"Разметка BrainPhotoTool (*{FILE_SUFFIX})"
+            self, "Открыть разметку", str(data_dir_for(self.groups)) if self.groups else "",
+            f"Разметка BrainPhotoTool (*{FILE_SUFFIX})"
         )
         if path:
             self._load_markup_file(Path(path), remember_path=True)
 
     def _restore_autosave(self) -> None:
-        path = autosave_path(self.mode)
-        if not path.exists():
+        files = list_autosaves(self.mode)
+        if not files:
             QMessageBox.information(self, "Нет автосохранения", "Автосохранённой разметки пока нет.")
             return
+        path = files[0]
+        if len(files) > 1:
+            # у каждого проекта своё автосохранение — даём выбрать, последнее сверху
+            labels = [
+                f"{datetime.fromtimestamp(f.stat().st_mtime):%d.%m.%Y %H:%M} — {f.stem}" for f in files
+            ]
+            label, ok = QInputDialog.getItem(
+                self, "Продолжить с автосохранения", "Какую разметку открыть (последняя — сверху):",
+                labels, 0, False,
+            )
+            if not ok:
+                return
+            path = files[labels.index(label)]
         self._load_markup_file(path, remember_path=False)
 
     def _load_markup_file(self, path: Path, remember_path: bool) -> None:
@@ -1518,6 +1682,8 @@ class PipelineTabs(QTabWidget):
         self.groups = loaded.groups
         self.project_tab.set_groups(loaded.groups)
         self.save_path = path if remember_path else None
+        # открыли автосохранение — дальше пишем в него же, а не в новый файл
+        self._autosave_file = None if remember_path else path
         self._dirty = False
         self.review_tab.load_reviews(loaded.reviews, loaded.current_index)
         self.setTabEnabled(1, True)
@@ -1567,6 +1733,7 @@ class PipelineTabs(QTabWidget):
 
         self.groups = groups
         self.save_path = None
+        self._autosave_file = None  # новый проект — новый файл автосохранения
         self._dirty = True
         self.review_tab.load_reviews(reviews)
         self.setTabEnabled(1, True)
