@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from .models import GroupConfig, MaskMode, SpecimenMask
+from .models import NOSE_SIDES, GroupConfig, MaskMode, SpecimenMask
 
 # минимальная площадь пятна в пикселях, чтобы не путать шум/пыль/битые пиксели с животным
 # (реальные срезы/черепа в образцах — от нескольких сотен пикселей, шумовые точки — до ~150)
@@ -524,6 +524,204 @@ def compute_rostral_cut(
     return rostral_mask, (p1, p2), is_elongated
 
 
+# Деление носа на левую и правую половину (сессия 9). Посередине носа тянется
+# тёмная перегородка — её ищем как непрерывный путь сверху вниз по самым тёмным
+# пикселям, но только в центральной части ширины черепа (края пятна тоже тёмные,
+# путь не должен уйти на край). Доля ширины, в пределах которой ищется путь:
+MIDLINE_SEARCH_FRACTION = 0.3
+# штраф за удаление пути от центра строки (в долях яркости строки) — чтобы на
+# участках без выраженной борозды путь шёл посередине, а не петлял по шуму
+MIDLINE_CENTER_PENALTY = 0.3
+# штраф за боковой шаг пути между соседними строками — борозда прямая или плавно
+# изогнутая, без этого путь «ступенькой» перескакивает на соседние тёмные пятна
+MIDLINE_STEP_PENALTY = 0.08
+# окно сглаживания пути и ширины тёмной полосы по вертикали (строк)
+MIDLINE_SMOOTH_ROWS = 15
+# какая верхняя доля высоты черепа используется для проведения средней линии
+MIDLINE_FIT_FRACTION = 0.6
+# насколько далеко от пути может простираться вырезаемая тёмная полоса (доля ширины)
+MIDLINE_GAP_MAX_FRACTION = 0.08
+# тёмная полоса = пиксели темнее, чем середина между дном борозды и яркостью по бокам
+MIDLINE_GAP_LEVEL = 0.5
+# если дно борозды темнее боков меньше чем на эту долю — тёмной полосы нет, между
+# масками остаётся только линия раздела в 1 пиксель
+MIDLINE_MIN_CONTRAST = 0.1
+
+
+
+def _row_extent(blob_mask: np.ndarray) -> dict[int, tuple[int, int]]:
+    extent = {}
+    for y in np.nonzero(blob_mask.any(axis=1))[0]:
+        xs = np.nonzero(blob_mask[y])[0]
+        extent[int(y)] = (int(xs.min()), int(xs.max()))
+    return extent
+
+
+def find_midline(image: np.ndarray, blob_mask: np.ndarray) -> dict[int, int]:
+    """Средняя линия черепа по тёмной срединной борозде: {y: x} для каждой строки пятна.
+
+    Сначала путь динамическим программированием по строкам сверху вниз (как «шов»
+    при content-aware resize): от строки к строке путь сдвигается не больше чем на
+    1 пиксель, стоимость пикселя — его яркость относительно средней яркости
+    строки плюс штраф за удаление от центра строки. Ищем только в центральной
+    полосе шириной MIDLINE_SEARCH_FRACTION от ширины черепа. Затем через путь
+    проводится плавная кривая (см. ниже) — она и возвращается.
+    """
+    arr = cv2.GaussianBlur(image.astype(np.float32), (0, 0), 1.5)
+    extent = _row_extent(blob_mask)
+    if not extent:
+        return {}
+    ys = sorted(extent)
+    x_lo, x_hi = min(e[0] for e in extent.values()), max(e[1] for e in extent.values())
+    width = x_hi - x_lo + 1
+    xs = np.arange(x_lo, x_hi + 1)
+    # центр строки сглажен по вертикали — у кончика носа и у неровного края
+    # отдельные строки кривые
+    centers = np.array([(extent[y][0] + extent[y][1]) / 2 for y in ys])
+    k = max(3, len(ys) // 15)
+    centers = np.convolve(np.pad(centers, k, mode="edge"), np.ones(2 * k + 1) / (2 * k + 1), mode="same")[k:-k]
+    half_band = max(3.0, width * MIDLINE_SEARCH_FRACTION / 2)
+
+    big = 1e9
+    cost = np.full((len(ys), width), big)
+    for i, y in enumerate(ys):
+        row = arr[y, x_lo : x_hi + 1]
+        inside = blob_mask[y, x_lo : x_hi + 1]
+        ref = float(row[inside].mean()) or 1.0
+        dist = np.abs(xs - centers[i])
+        ok = inside & (dist <= half_band)
+        if not ok.any():
+            ok = dist <= max(1.0, dist.min())
+        cost[i, ok] = row[ok] / ref + MIDLINE_CENTER_PENALTY * (dist[ok] / half_band) ** 2
+
+    acc = cost.copy()
+    back = np.zeros_like(acc, dtype=np.int64)
+    for i in range(1, len(ys)):
+        prev = acc[i - 1]
+        step = MIDLINE_STEP_PENALTY
+        cand = np.stack([np.r_[big, prev[:-1]] + step, prev, np.r_[prev[1:], big] + step])
+        choice = np.argmin(cand, axis=0)
+        acc[i] += cand[choice, np.arange(width)]
+        back[i] = np.arange(width) + choice - 1
+
+    raw = np.zeros(len(ys))
+    j = int(np.argmin(acc[-1]))
+    for i in range(len(ys) - 1, -1, -1):
+        raw[i] = x_lo + j
+        j = int(back[i, j])
+    # путь по яркости местами виляет на соседние тёмные пятна, поэтому через него
+    # проводится плавная кривая (парабола — нос бывает слегка изогнут вбок, прямая
+    # тогда отдаёт кончик носа целиком одной стороне). Берём верхние
+    # MIDLINE_FIT_FRACTION строк черепа (нос и чуть ниже): в мозговой коробке свои
+    # тёмные детали, которые не должны тянуть линию; ниже — продолжение по касательной
+    ys_arr = np.array(ys, dtype=np.float64)
+    fit_end = ys_arr[0] + (ys_arr[-1] - ys_arr[0]) * MIDLINE_FIT_FRACTION
+    use = ys_arr <= fit_end
+    if use.sum() < 5:
+        use[:] = True
+    fy, fx = ys_arr[use], raw[use]
+    deg = 2 if len(fy) >= 15 else 1
+    coef = np.polyfit(fy, fx, deg)
+    for _ in range(3):
+        resid = np.abs(fx - np.polyval(coef, fy))
+        cut = max(2.0, 2.5 * 1.4826 * float(np.median(resid)))
+        keep = resid <= cut
+        if keep.sum() < 5:
+            break
+        coef = np.polyfit(fy[keep], fx[keep], deg)
+    y_end = float(fy.max())
+    x_end = float(np.polyval(coef, y_end))
+    slope_end = float(np.polyval(np.polyder(coef), y_end))
+    curve = np.where(ys_arr <= y_end, np.polyval(coef, ys_arr), x_end + slope_end * (ys_arr - y_end))
+    return {y: int(round(x)) for y, x in zip(ys, curve)}
+
+
+def _smooth_rows(values: np.ndarray, window: int) -> np.ndarray:
+    """Медиана (убирает одиночные выбросы) + скользящее среднее по строкам."""
+    if len(values) < 3:
+        return values.astype(np.float64)
+    h = min(window // 2, (len(values) - 1) // 2)
+    padded = np.pad(values.astype(np.float64), h, mode="edge")
+    med = np.array([np.median(padded[i : i + 2 * h + 1]) for i in range(len(values))])
+    padded = np.pad(med, h, mode="edge")
+    return np.convolve(padded, np.ones(2 * h + 1) / (2 * h + 1), mode="valid")
+
+
+def split_left_right(
+    image: np.ndarray, blob_mask: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, dict[int, int]]:
+    """Делит пятно черепа на левую и правую половину по срединной борозде.
+
+    Тёмная полоса вдоль борозды (перегородка между половинами носа) не входит ни в
+    одну маску — маски обходят её по краю. Ширина полосы своя в каждой строке:
+    пиксели около средней линии, которые темнее середины между дном борозды и
+    яркостью по бокам от неё, но не дальше MIDLINE_GAP_MAX_FRACTION ширины черепа от
+    линии. Дно борозды в маски не входит никогда (минимальный зазор — 1 пиксель).
+    """
+    path = find_midline(image, blob_mask)
+    left = np.zeros_like(blob_mask, dtype=bool)
+    right = np.zeros_like(blob_mask, dtype=bool)
+    if not path:
+        return left, right, path
+    arr = cv2.GaussianBlur(image.astype(np.float32), (0, 0), 1.0)
+    xs_all = np.nonzero(blob_mask.any(axis=0))[0]
+    width = int(xs_all.max() - xs_all.min() + 1)
+    max_gap = max(2, int(round(width * MIDLINE_GAP_MAX_FRACTION)))
+    flank_w = max(3, max_gap)
+
+    # в каждой строке рядом с линией ищем дно борозды и от него — края тёмной
+    # полосы; края затем сглаживаются по вертикали, чтобы контур масок вдоль
+    # перегородки был ровным, без «пилы»
+    ys = sorted(path)
+    edges = np.zeros((len(ys), 2))
+    for i, y in enumerate(ys):
+        xm = path[y]
+        row = arr[y]
+        inside = blob_mask[y]
+        lo, hi = max(0, xm - max_gap // 2), min(len(row) - 1, xm + max_gap // 2)
+        xv = lo + int(np.argmin(row[lo : hi + 1]))
+        valley = float(row[xv])
+        flanks = []
+        for a, b in ((xm - max_gap - flank_w, xm - max_gap), (xm + max_gap, xm + max_gap + flank_w)):
+            a, b = max(0, a), min(len(row), b)
+            sel = inside[a:b]
+            if sel.any():
+                flanks.append(float(np.median(row[a:b][sel])))
+        flank = min(flanks) if flanks else valley
+        level = valley + MIDLINE_GAP_LEVEL * (flank - valley)
+        if flank - valley < MIDLINE_MIN_CONTRAST * max(flank, 1e-6):
+            level = valley   # борозды здесь не видно — только тонкая линия раздела
+        for k, step in enumerate((-1, 1)):
+            x = xv + step
+            while abs(x - xm) <= max_gap and 0 <= x < len(row) and row[x] < level:
+                x += step
+            edges[i, k] = x - step
+    edges = np.column_stack([_smooth_rows(edges[:, k], MIDLINE_SMOOTH_ROWS) for k in range(2)])
+
+    cols = np.arange(blob_mask.shape[1])[None, :]
+    gap_a = np.full(blob_mask.shape[0], -1.0)
+    gap_b = np.full(blob_mask.shape[0], -1.0)
+    for i, y in enumerate(ys):
+        gap_a[y] = np.floor(edges[i, 0])
+        gap_b[y] = np.ceil(edges[i, 1])
+    rows_with_path = gap_a >= 0
+    is_left = (cols < gap_a[:, None]) & rows_with_path[:, None]
+    is_right = (cols > gap_b[:, None]) & rows_with_path[:, None]
+    gap = rows_with_path[:, None] & ~is_left & ~is_right
+    body = blob_mask & ~gap
+    left = _largest_component(body & is_left)
+    right = _largest_component(body & is_right)
+    return left, right, path
+
+
+def _largest_component(mask: np.ndarray) -> np.ndarray:
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=4)
+    if n <= 1:
+        return mask.astype(bool)
+    best = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    return labels == best
+
+
 def build_masks_for_image(
     image: np.ndarray, group: GroupConfig
 ) -> tuple[list[SpecimenMask], str | None]:
@@ -557,32 +755,41 @@ def build_masks_for_image(
             masks.append(SpecimenMask(animal_index=animal_index, slice_index=slice_index, mask=grown.mask))
         return masks, warning
 
+    # ROSTRAL_CUT: у каждого животного две маски — левая (slice_index 0) и правая (1)
+    # половина носа, тёмная перегородка посередине не входит ни в одну (сессия 9)
     poorly_elongated_animals: list[int] = []
     for animal_index in range(group.cols):
-        for slice_index in range(resolved_rows):
-            blob = assignment.get((animal_index, slice_index))
-            if blob is None:
+        blob = assignment.get((animal_index, 0))
+        if blob is None:
+            for side in range(len(NOSE_SIDES)):
                 masks.append(
                     SpecimenMask(
                         animal_index=animal_index,
-                        slice_index=slice_index,
+                        slice_index=side,
                         mask=np.zeros(image.shape[:2], dtype=bool),
                     )
                 )
-            else:  # ROSTRAL_CUT
-                rostral_mask, cut_line, is_elongated = compute_rostral_cut(blob.mask)
-                if not is_elongated:
-                    poorly_elongated_animals.append(animal_index + 1)
-                masks.append(
-                    SpecimenMask(
-                        animal_index=animal_index,
-                        slice_index=slice_index,
-                        mask=rostral_mask,
-                        cut_line=cut_line,
-                        source_blob=blob.mask,
-                        rostral_anchor=_mask_centroid(rostral_mask),
-                    )
+            continue
+        rostral_mask, cut_line, is_elongated = compute_rostral_cut(blob.mask)
+        if not is_elongated:
+            poorly_elongated_animals.append(animal_index + 1)
+        anchor = _mask_centroid(rostral_mask)
+        # половины делятся по всему черепу, а нос из них вырезается той же линией
+        # отреза — так при перетаскивании линии каждая половина пересчитывается
+        # от своей половины черепа (source_blob) и перегородка остаётся вырезанной
+        halves = split_left_right(image, blob.mask)[:2]
+        for side, half in enumerate(halves):
+            half_nose = recompute_rostral_mask_from_line(half, cut_line, anchor)
+            masks.append(
+                SpecimenMask(
+                    animal_index=animal_index,
+                    slice_index=side,
+                    mask=half_nose,
+                    cut_line=cut_line,
+                    source_blob=half,
+                    rostral_anchor=anchor,
                 )
+            )
 
     if poorly_elongated_animals:
         note = (

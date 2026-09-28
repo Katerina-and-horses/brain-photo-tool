@@ -10,7 +10,7 @@ from PySide6.QtGui import QBrush, QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QWidget
 
 from .colors import color_for_animal
-from .models import SpecimenMask
+from .models import MaskMode, SpecimenMask, part_label
 from .segmentation import apply_polygon_edit, mask_to_polygon, recompute_rostral_mask_from_line
 
 HANDLE_HIT_RADIUS_PX = 14  # в экранных пикселях — попадание по вершине (клик/тяга)
@@ -39,6 +39,8 @@ class MaskCanvas(QWidget):
 
         self.image_u8: np.ndarray | None = None
         self.masks: list[SpecimenMask] = []
+        # пайплайн — только для подписи маски («срез 2» / «левая половина»)
+        self.mode: MaskMode | None = None
         # активна ОДНА конкретная маска (животное, срез) — не всё животное сразу,
         # иначе при нескольких срезах на животное правка всегда попадала бы в первый срез
         self.active_key: tuple[int, int] | None = None
@@ -227,6 +229,15 @@ class MaskCanvas(QWidget):
                 return m
         return None
 
+    def _cut_line_siblings(self, m: SpecimenMask) -> list[SpecimenMask]:
+        """Маски того же животного с той же линией отреза (левая и правая половина
+        носа) — линия у них общая и перетаскивается сразу у обеих."""
+        return [
+            o for o in self.masks
+            if o is m or (o.animal_index == m.animal_index and o.cut_line is not None
+                          and o.cut_line == m.cut_line)
+        ]
+
     # ---------- геометрия ----------
 
     def _recompute_draw_rect(self) -> None:
@@ -378,10 +389,11 @@ class MaskCanvas(QWidget):
         ys, xs = np.nonzero(m.mask)
         top = self._to_screen((float(xs.min()), float(ys.min())))
         text = f"Животное {m.animal_index + 1}"
-        # как в списке слева: номер среза — только если у животного их несколько
-        # (у черепов в пайплайне носа маска на животное одна)
-        if sum(1 for o in self.masks if o.animal_index == m.animal_index) > 1:
-            text += f", срез {m.slice_index + 1}"
+        # как в списке слева: номер среза — только если у животного их несколько,
+        # у носа — какая половина
+        part = part_label(self.mode, self.masks, m)
+        if part:
+            text += f", {part}"
         font = QFont(painter.font())
         font.setBold(True)
         painter.setFont(font)
@@ -638,7 +650,9 @@ class MaskCanvas(QWidget):
             m, idx = self._dragging_handle
             other = m.cut_line[1 - idx]
             new_line = (img_pt, other) if idx == 0 else (other, img_pt)
-            m.cut_line = new_line
+            # у носа две половины с общей линией отреза — тянем её у обеих сразу
+            for o in self._cut_line_siblings(m):
+                o.cut_line = new_line
             self.update()
             return
         if self._dragging_brush:
@@ -665,8 +679,10 @@ class MaskCanvas(QWidget):
             self.maskEdited.emit()
             self.update()
         if self._dragging_handle is not None:
-            m, _ = self._dragging_handle
-            if m.source_blob is not None and m.cut_line is not None:
+            dragged, _ = self._dragging_handle
+            for m in self._cut_line_siblings(dragged):
+                if m.source_blob is None or m.cut_line is None:
+                    continue
                 p1, p2 = m.cut_line
                 degenerate = (p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2 < 1.0
                 if degenerate:
@@ -675,17 +691,16 @@ class MaskCanvas(QWidget):
                     # весь исходный blob целиком (весь череп). Оставляем маску как
                     # была — пользователь должен развести ручки снова, а не получить
                     # тихо неверный результат
-                    pass
-                else:
-                    # опорная точка фиксируется один раз при автоопределении (центроид
-                    # изначальной носовой части) и не пересчитывается — иначе при
-                    # перетаскивании линии сторона выбора могла неожиданно инвертироваться
-                    ref = m.rostral_anchor if m.rostral_anchor is not None else (0.0, 0.0)
-                    m.mask = recompute_rostral_mask_from_line(m.source_blob, m.cut_line, ref)
-                    # перетаскивание линии — тоже правка; раньше только кисть сбрасывала
-                    # "принято", и перетащенная-но-непроверенная маска могла остаться
-                    # помеченной как принятая
-                    m.accepted = False
+                    continue
+                # опорная точка фиксируется один раз при автоопределении (центроид
+                # изначальной носовой части) и не пересчитывается — иначе при
+                # перетаскивании линии сторона выбора могла неожиданно инвертироваться
+                ref = m.rostral_anchor if m.rostral_anchor is not None else (0.0, 0.0)
+                m.mask = recompute_rostral_mask_from_line(m.source_blob, m.cut_line, ref)
+                # перетаскивание линии — тоже правка; раньше только кисть сбрасывала
+                # "принято", и перетащенная-но-непроверенная маска могла остаться
+                # помеченной как принятая
+                m.accepted = False
             self._dragging_handle = None
             self.maskEdited.emit()
             self.update()

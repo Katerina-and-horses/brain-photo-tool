@@ -23,14 +23,16 @@ from PySide6.QtWidgets import (
 
 from .canvas import MaskCanvas
 from .colors import color_for_animal
-from .editing import add_mask, animal_count, delete_mask, move_mask, slices_of
+from .editing import (
+    add_mask, animal_count, clear_or_delete_side, delete_mask, move_animal, move_mask, slices_of,
+)
 from .folders import SUBFOLDER_TITLES, data_dir_for, find_group_folders
 from .imaging import (
     MASK_SATURATION_FRACTION_LIMIT, choose_mask_exposure, contrast_stretch_to_uint8, load_image,
     mask_saturation_fraction, scan_group_folder, unsaturated_exposures,
 )
 from .measurements import export_table, measure_shot, per_animal_average, rows_to_dataframe
-from .models import GroupConfig, MaskMode, MeasurementRow, ShotReview
+from .models import NOSE_SIDES, GroupConfig, MaskMode, MeasurementRow, ShotReview, part_label
 from .project_io import (
     FILE_SUFFIX, file_stem, list_autosaves, load_markup, new_autosave_path, prune_autosaves,
     save_markup, unique_path,
@@ -340,7 +342,8 @@ class ReassignDialog(QDialog):
 
         layout.addRow(QLabel(
             f"Сейчас: животное {target.animal_index + 1}"
-            + (f", срез {target.slice_index + 1}" if allow_slices else "")
+            + (f", срез {target.slice_index + 1}" if allow_slices
+               else " (переносятся обе половины носа вместе)")
         ))
 
         self.animal_combo = QComboBox()
@@ -417,7 +420,10 @@ HELP_HTML = """
 </table>
 <p style="margin-top:6px"><b>Режим точек:</b> тянуть точку контура мышью; двойной клик на
 линии — добавить точку; правый клик по точке — убрать её.</p>
-<p><b>Черепа:</b> линию отреза тянуть за белые точки.</p>
+<p><b>Черепа:</b> нос размечен двумя масками — левая и правая половина (тёмная
+перегородка посередине не входит ни в одну). Линию отреза тянуть за белые точки —
+она общая для обеих половин. «Удалить маску» у половины оставляет её пустой, чтобы
+дорисовать кистью; удалите обе — животное уберётся.</p>
 """
 
 
@@ -450,6 +456,7 @@ class ReviewTab(QWidget):
         layout.addWidget(splitter, 1)
 
         self.canvas = MaskCanvas()
+        self.canvas.mode = mode
         self.canvas.maskEdited.connect(self._on_mask_edited)
         self.canvas.activeChanged.connect(self._sync_tree_selection)
         self.canvas.findHereRequested.connect(self._find_here)
@@ -666,7 +673,7 @@ class ReviewTab(QWidget):
             self.mask_tree.addTopLevelItem(parent)
             for m in slices:
                 if self.mode == MaskMode.ROSTRAL_CUT:
-                    label = "маска носа"
+                    label = part_label(self.mode, review.masks, m)
                 else:
                     label = f"срез {m.slice_index + 1}"
                 if not m.mask.any():
@@ -797,15 +804,11 @@ class ReviewTab(QWidget):
             return
         animal, slice_pos, new_animal = dialog.choice()
         self.canvas.push_undo()
-        if self.mode == MaskMode.ROSTRAL_CUT and not new_animal:
-            # у черепов на животное одна маска — меняемся местами с маской того животного
-            other = next((o for o in review.masks if o.animal_index == animal and o is not m), None)
-            if other is not None:
-                other.animal_index, m.animal_index = m.animal_index, animal
-                other.accepted = m.accepted = False
-                review.masks.sort(key=lambda x: (x.animal_index, x.slice_index))
-            else:
-                move_mask(review.masks, m, animal, 0)
+        if self.mode == MaskMode.ROSTRAL_CUT:
+            # у носа переносится животное целиком (обе половины): с существующим
+            # животным меняемся номерами, новое — встаёт на выбранное место
+            if animal != m.animal_index or new_animal:
+                move_animal(review.masks, m.animal_index, animal, new_animal=new_animal)
         else:
             move_mask(review.masks, m, animal, slice_pos, new_animal=new_animal)
         self.canvas.set_active_mask(m.animal_index, m.slice_index)
@@ -819,7 +822,15 @@ class ReviewTab(QWidget):
         if review is None or m is None:
             return
         self.canvas.push_undo()
-        delete_mask(review.masks, m)
+        if self.mode == MaskMode.ROSTRAL_CUT:
+            if not clear_or_delete_side(review.masks, m):
+                # половина стала пустой и остаётся выбранной — её можно дорисовать
+                self.canvas.update()
+                self._refresh_side()
+                self._mark_changed()
+                return
+        else:
+            delete_mask(review.masks, m)
         if review.masks:
             first = review.masks[0]
             self.canvas.set_active_mask(first.animal_index, first.slice_index)
@@ -1027,7 +1038,8 @@ class ResultsTab(QWidget):
         self.compare_by_combo.addItem("Условию (все со всеми)", "condition")
         controls_row.addWidget(self.compare_by_combo)
 
-        controls_row.addWidget(QLabel("Срез:"))
+        self.slice_label = QLabel("Срез:")   # у носа — «Половина:» (_refresh_slice_options)
+        controls_row.addWidget(self.slice_label)
         self.slice_combo = QComboBox()
         self.slice_combo.addItem("Среднее по животному (все срезы)", None)
         self.slice_combo.currentIndexChanged.connect(self._refresh_slice_warning)
@@ -1232,16 +1244,24 @@ class ResultsTab(QWidget):
         измерениях — для сравнения "по срезу №N" вместо "среднее по животному"
         (номера появляются/исчезают по мере разметки, поэтому список строится
         динамически, а не фиксированным набором)."""
-        values: list[int] = []
-        if not self.slice_df.empty and "slice_index" in self.slice_df.columns:
-            values = sorted(int(v) for v in self.slice_df["slice_index"].dropna().unique())
-
         current = self.slice_combo.currentData()
         self.slice_combo.blockSignals(True)
         self.slice_combo.clear()
-        self.slice_combo.addItem("Среднее по животному (все срезы)", None)
-        for slice_index in values:
-            self.slice_combo.addItem(f"Только срез №{slice_index}", slice_index)
+        self.slice_label.setText("Половина:" if self._is_nose() else "Срез:")
+        if self._is_nose():
+            # у носа вместо номера среза — сторона (строка), см. _slice_filter_info
+            self.slice_combo.addItem("Весь нос (обе половины вместе)", None)
+            present = set(self.slice_df["side"].dropna().unique())
+            for side in NOSE_SIDES:
+                if side in present:
+                    self.slice_combo.addItem(f"Только {self._part_text(side)}", side)
+        else:
+            values: list[int] = []
+            if not self.slice_df.empty and "slice_index" in self.slice_df.columns:
+                values = sorted(int(v) for v in self.slice_df["slice_index"].dropna().unique())
+            self.slice_combo.addItem("Среднее по животному (все срезы)", None)
+            for slice_index in values:
+                self.slice_combo.addItem(f"Только {self._part_text(slice_index)}", slice_index)
         idx = self.slice_combo.findData(current)
         self.slice_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.slice_combo.blockSignals(False)
@@ -1259,9 +1279,18 @@ class ResultsTab(QWidget):
             return filtered, 0
         animal_cols = ["group", "mode", "source_file", "animal_index"]
         total = filtered[animal_cols].drop_duplicates().shape[0]
-        sliced = filtered[filtered["slice_index"] == slice_index]
+        column = "side" if isinstance(slice_index, str) else "slice_index"
+        sliced = filtered[filtered[column] == slice_index]
         kept = sliced[animal_cols].drop_duplicates().shape[0]
         return sliced, total - kept
+
+    def _is_nose(self) -> bool:
+        return "side" in self.slice_df.columns and not self.slice_df.empty
+
+    @staticmethod
+    def _part_text(value) -> str:
+        """«срез №2» для срезов, «левая половина» для носа (значение из slice_combo)."""
+        return f"{value} половина" if isinstance(value, str) else f"срез №{value}"
 
     def _refresh_slice_warning(self) -> None:
         slice_index = self.slice_combo.currentData()
@@ -1269,14 +1298,15 @@ class ResultsTab(QWidget):
             self.slice_warning_label.setText("")
             return
         _, dropped = self._slice_filter_info()
+        part = self._part_text(slice_index)
+        part = part[:1].upper() + part[1:]
+        what = "этой половины" if isinstance(slice_index, str) else "этого среза"
         if dropped:
             self.slice_warning_label.setText(
-                f"Срез №{slice_index}: исключено из сравнения животных без этого среза — {dropped}."
+                f"{part}: исключено из сравнения животных без {what} — {dropped}."
             )
         else:
-            self.slice_warning_label.setText(
-                f"Срез №{slice_index}: у всех животных есть этот срез, никто не исключён."
-            )
+            self.slice_warning_label.setText(f"{part}: есть у всех животных, никто не исключён.")
 
     def _show_dataframe(self, df: pd.DataFrame) -> None:
         # сортировка по группе уже применена вызывающим кодом (_refresh_table) —
@@ -1415,10 +1445,11 @@ class ResultsTab(QWidget):
             return
 
         slice_index = self.slice_combo.currentData()
-        unit_note = (
-            "единица анализа — животное, срезы усреднены" if slice_index is None
-            else f"единица анализа — животное, только срез №{slice_index}"
-        )
+        if slice_index is None:
+            unit_note = ("единица анализа — животное, обе половины носа вместе" if self._is_nose()
+                         else "единица анализа — животное, срезы усреднены")
+        else:
+            unit_note = f"единица анализа — животное, только {self._part_text(slice_index)}"
         lines = [
             f"Метод: {result.test_name} ({unit_note})",
             f"Группы: {', '.join(f'{g} (n={result.n_per_group[g]})' for g in result.groups)}",
@@ -1428,8 +1459,8 @@ class ResultsTab(QWidget):
             _, dropped = self._slice_filter_info()
             if dropped:
                 lines.append(
-                    f"\nВНИМАНИЕ: при выборе среза №{slice_index} исключено животных без "
-                    f"этого среза — {dropped}. Результат относится только к оставшимся."
+                    f"\nВНИМАНИЕ: при выборе «{self._part_text(slice_index)}» исключено животных "
+                    f"без неё — {dropped}. Результат относится только к оставшимся."
                 )
 
         exposure = self.exposure_combo.currentData()
@@ -1477,7 +1508,7 @@ class ResultsTab(QWidget):
 
     def _plot_title_suffix(self) -> str:
         slice_index = self.slice_combo.currentData()
-        where = " (по животным" if slice_index is None else f" (срез №{slice_index}"
+        where = " (по животным" if slice_index is None else f" ({self._part_text(slice_index)}"
         return f"{where}, {self.exposure_combo.currentData()} мс)"
 
     def _save_plot(self) -> None:

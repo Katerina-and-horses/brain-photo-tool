@@ -15,6 +15,33 @@ class MaskMode(str, Enum):
     ROSTRAL_CUT = "rostral_cut"     # носовая (передняя) часть черепа
 
 
+# Нос (ROSTRAL_CUT) с сессии 9 размечается двумя масками на животное — левая и правая
+# половина (сторона НА ФОТО), slice_index 0 / 1. Разметка, сохранённая до сессии 9,
+# содержит одну маску носа на животное — она подписывается «нос целиком».
+NOSE_SIDES = ("левая", "правая")
+NOSE_WHOLE = "целиком"
+
+
+def nose_side(masks: list, m) -> str:
+    """Сторона маски носа: «левая» / «правая» или «целиком» (старая разметка —
+    одна маска на животное)."""
+    siblings = sum(1 for o in masks if o.animal_index == m.animal_index)
+    if siblings >= 2 and m.slice_index < len(NOSE_SIDES):
+        return NOSE_SIDES[m.slice_index]
+    return NOSE_WHOLE
+
+
+def part_label(mode: "MaskMode", masks: list, m) -> str | None:
+    """Подпись маски внутри животного для интерфейса: «левая половина» / «срез 2».
+    None — подпись не нужна (у животного единственный срез)."""
+    if mode == MaskMode.ROSTRAL_CUT:
+        side = nose_side(masks, m)
+        return "нос целиком" if side == NOSE_WHOLE else f"{side} половина"
+    if sum(1 for o in masks if o.animal_index == m.animal_index) > 1:
+        return f"срез {m.slice_index + 1}"
+    return None
+
+
 @dataclass
 class GroupConfig:
     """Настройки одной группы (=одна папка с фото)."""
@@ -118,3 +145,5 @@ class MeasurementRow:
     # изменений, чтобы результаты можно было сравнивать не только "группа vs группа"
     is_control: bool = False
     condition: str = ""
+    # сторона носа («левая» / «правая» / «целиком», см. NOSE_SIDES); у срезов пусто
+    side: str = ""

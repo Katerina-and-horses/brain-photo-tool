@@ -162,3 +162,60 @@ def delete_mask(masks: list[SpecimenMask], m: SpecimenMask) -> None:
     masks.remove(m)
     if masks:
         _compact(masks)
+
+
+# ---------- нос: две половины на животное (сессия 9) ----------
+# У носа slice_index — это сторона (0 левая, 1 правая), а не порядковый номер, поэтому
+# половину нельзя просто удалить: уплотнение номеров превратило бы оставшуюся правую
+# в «левую». Животное переносится целиком, обе половины вместе.
+
+
+def clear_or_delete_side(masks: list[SpecimenMask], m: SpecimenMask) -> bool:
+    """Удаление половины носа: пока у животного есть другая непустая половина, эта
+    остаётся пустой (её можно дорисовать кистью); если непустых половин больше нет —
+    удаляется всё животное. True — животное удалено."""
+    siblings = [o for o in masks if o.animal_index == m.animal_index and o is not m]
+    if any(o.mask.any() for o in siblings):
+        m.mask = np.zeros_like(m.mask)
+        m.cut_line = None
+        m.source_blob = None
+        m.rostral_anchor = None
+        m.polygon = None
+        m.accepted = False
+        return False
+    for o in [m, *siblings]:
+        masks.remove(o)
+    if masks:
+        _compact(masks)
+    return True
+
+
+def move_animal(masks: list[SpecimenMask], animal_index: int, dest: int, new_animal: bool = False) -> None:
+    """Переносит все маски животного разом. `new_animal=False` — меняется номерами с
+    животным `dest`; `True` — встаёт отдельным животным на место `dest` (номер в
+    нумерации до переноса), остальные сдвигаются."""
+    group = [m for m in masks if m.animal_index == animal_index]
+    if not new_animal:
+        for o in masks:
+            if o.animal_index == dest:
+                o.animal_index = animal_index
+                o.accepted = False
+        for m in group:
+            m.animal_index = dest
+            m.accepted = False
+        masks.sort(key=lambda x: (x.animal_index, x.slice_index))
+        return
+    for m in group:
+        masks.remove(m)
+    if dest > animal_index:
+        dest -= 1   # само животное освобождает свой номер
+    animals = sorted({m.animal_index for m in masks})
+    remap = {a: i for i, a in enumerate(animals)}
+    for m in masks:
+        m.animal_index = remap[m.animal_index]
+    _make_room_for_animal(masks, dest)
+    for m in group:
+        m.animal_index = dest
+        m.accepted = False
+    masks.extend(group)
+    masks.sort(key=lambda x: (x.animal_index, x.slice_index))
