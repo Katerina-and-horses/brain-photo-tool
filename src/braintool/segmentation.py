@@ -714,9 +714,12 @@ def split_left_right(
     return left, right, path
 
 
-# Граница носа по яркости (сессия 9, по скриншоту пользователя): нос заметно ярче
-# остального черепа, и его нижний край — это переход яркого в тусклое, а не прямая.
-# Порог — посередине между медианой носа и медианой остального черепа.
+# Нижний край носа по яркости (сессия 9, по скриншотам пользователя): нос заметно ярче
+# остального черепа, и его низ — это переход яркого в тусклое (закруглённые доли, тёмный
+# клин между ними), а не прямая. Бока и кончик — по краю ткани целиком: граница по
+# яркости со всех сторон теряла тусклый ободок и делала тусклую половину меньше яркой
+# (скрины 569–570). Порог — посередине между медианой носа и медианой остального черепа
+# своей половины, так что более яркая сторона не получает маску больше.
 NOSE_LEVEL = 0.5
 # если нос ярче остального черепа меньше чем во столько раз (оба — за вычетом фона
 # камеры) — граница по яркости ненадёжна, остаётся прямой отрез по «талии». Без
@@ -725,9 +728,24 @@ NOSE_MIN_CONTRAST = 1.3
 # насколько ниже найденной «талии» может уходить яркий нос (доля длины носа) — дальше
 # яркое уже не считается носом. 35% обрезало закруглённый низ долей по прямой
 NOSE_EXTEND_FRACTION = 0.5
-# кончик носа тусклее середины, но в нос входит: верхняя доля длины носа берётся по
-# контуру черепа целиком, яркость решает только, где нос кончается снизу
-NOSE_TIP_FRACTION = 0.4
+# окно сглаживания нижнего края по столбцам (px): меньше — рваный край, больше —
+# заплывает тёмный клин между долями
+NOSE_BOTTOM_SMOOTH_PX = 7
+# узкие выступы нижнего края вниз (яркая полоска вдоль перегородки) уже этой доли
+# ширины половины срезаются; узкие вырезы вверх (тёмный клин) остаются
+NOSE_SPIKE_FRACTION = 0.35
+
+
+def _cut_narrow_spikes(values: np.ndarray, window: int) -> np.ndarray:
+    """Морфологическое открытие профиля (минимум, затем максимум в окне): убирает
+    узкие пики (выступы вниз), не трогая узкие провалы (вырезы вверх)."""
+    h = max(1, window // 2)
+    if len(values) <= 2 * h:
+        return values
+    pad = np.pad(values, h, mode="edge")
+    lo = np.lib.stride_tricks.sliding_window_view(pad, 2 * h + 1).min(axis=1)
+    pad = np.pad(lo, h, mode="edge")
+    return np.lib.stride_tricks.sliding_window_view(pad, 2 * h + 1).max(axis=1)
 
 
 def _shift_line(line, shift_vec) -> tuple[tuple[float, float], tuple[float, float]]:
@@ -735,35 +753,41 @@ def _shift_line(line, shift_vec) -> tuple[tuple[float, float], tuple[float, floa
     return ((x1 + shift_vec[0], y1 + shift_vec[1]), (x2 + shift_vec[0], y2 + shift_vec[1]))
 
 
-def nose_by_brightness(
+def _nose_level(arr, rostral, caudal, background) -> float | None:
+    if rostral.sum() < 50 or caudal.sum() < 50:
+        return None
+    nose_med = float(np.median(arr[rostral]))
+    rest_med = float(np.median(arr[caudal]))
+    if nose_med - background < NOSE_MIN_CONTRAST * max(rest_med - background, 1e-6):
+        return None
+    return rest_med + NOSE_LEVEL * (nose_med - rest_med)
+
+
+def nose_halves(
     image: np.ndarray,
     blob_mask: np.ndarray,
+    halves: list[np.ndarray],
     cut_line: tuple[tuple[float, float], tuple[float, float]],
     anchor: tuple[float, float],
     background: float,
-) -> np.ndarray | None:
-    """Яркая носовая часть черепа.
+) -> list[np.ndarray] | None:
+    """Нос по половинам: всё, что в половине черепа выше нижнего края носа.
 
-    Порог — посередине между медианой яркости выше «талии» (`compute_rostral_cut`)
-    и ниже неё. Берётся яркое, связанное с носом, не ниже линии отреза, сдвинутой
-    вниз на NOSE_EXTEND_FRACTION длины носа. Тёмный клин между долями снизу в маску
-    не попадает сам (он темнее порога). None — нос не ярче остального черепа
-    настолько, чтобы граница по яркости была надёжной.
+    Нижний край ищется по столбцам: в каждом столбце — самая нижняя точка яркой
+    части носа (ярче порога своей половины, связана с носом выше «талии», не ниже
+    ограничителя — «талии», сдвинутой вниз на NOSE_EXTEND_FRACTION длины носа).
+    В столбцах без яркого (тусклый ободок у края) край продолжается от соседних,
+    затем сглаживается. Бока и кончик остаются по краю ткани; тёмный клин между
+    долями снизу выпадает сам (в его столбцах яркое кончается выше).
+    None — нос не ярче остального черепа настолько, чтобы край по яркости был надёжен.
     """
     arr = cv2.GaussianBlur(image.astype(np.float32), (0, 0), 2.0)
     rostral = recompute_rostral_mask_from_line(blob_mask, cut_line, anchor)
     caudal = blob_mask & ~rostral
-    if rostral.sum() < 50 or caudal.sum() < 50:
+    common = _nose_level(arr, rostral, caudal, background)
+    if common is None:
         return None
-    nose_med = float(np.median(arr[rostral])) - background
-    rest_med = float(np.median(arr[caudal])) - background
-    if nose_med < NOSE_MIN_CONTRAST * max(rest_med, 1e-6):
-        return None
-    nose_med += background
-    rest_med += background
-    level = rest_med + NOSE_LEVEL * (nose_med - rest_med)
 
-    # линия-ограничитель: та же «талия», сдвинутая от носа на долю его длины
     p1, p2 = np.array(cut_line[0]), np.array(cut_line[1])
     normal = np.array([-(p2 - p1)[1], (p2 - p1)[0]])
     normal /= max(np.linalg.norm(normal), 1e-9)
@@ -771,41 +795,42 @@ def nose_by_brightness(
         normal = -normal   # normal смотрит от носа (вниз по черепу)
     ys, xs = np.nonzero(rostral)
     nose_len = float(np.max(-((np.column_stack([xs, ys]) - p1) @ normal)))
-    bys, bxs = np.nonzero(blob_mask)
-    height = -((np.column_stack([bxs, bys]) - p1) @ normal)   # выше «талии» — больше
-    tip_zone = np.zeros_like(blob_mask, dtype=bool)
-    sel = height >= nose_len * (1 - NOSE_TIP_FRACTION)
-    tip_zone[bys[sel], bxs[sel]] = True
     limit_line = _shift_line(cut_line, normal * nose_len * NOSE_EXTEND_FRACTION)
     allowed = recompute_rostral_mask_from_line(blob_mask, limit_line, anchor)
-
-    bright = (allowed & (arr >= level)).astype(np.uint8)
     ell = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    bright = cv2.morphologyEx(bright, cv2.MORPH_OPEN, ell)
-    bright = cv2.morphologyEx(bright, cv2.MORPH_CLOSE, ell)
-    # оставляем куски, заходящие в нос выше «талии» (отдельные яркие пятна ниже — нет)
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(bright, connectivity=8)
-    keep = np.zeros_like(blob_mask, dtype=bool)
-    for lab in range(1, n):
-        comp = labels == lab
-        if (comp & rostral).sum() >= 0.1 * rostral.sum():
-            keep |= comp
-    if not keep.any():
-        return None
-    keep |= tip_zone
-    # дырки внутри (тёмные точки на носу) заполняем; клин снизу открыт наружу — не дырка
-    filled = keep.astype(np.uint8).copy()
-    ff = np.zeros((filled.shape[0] + 2, filled.shape[1] + 2), np.uint8)
-    cv2.floodFill(filled, ff, (0, 0), 2)
-    keep |= filled == 0
-    # сглаживаем стык кончика и яркой части (без этого на боках «ступеньки»);
-    # тёмный клин посередине, даже если закрытие его перекроет, вырежет деление
-    # на половины (split_left_right)
-    smooth = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    keep_u8 = cv2.morphologyEx(keep.astype(np.uint8), cv2.MORPH_OPEN, smooth)
-    keep_u8 = cv2.morphologyEx(keep_u8, cv2.MORPH_CLOSE, smooth)
-    keep = (keep_u8 > 0) & blob_mask
-    return keep & allowed
+
+    out = []
+    for half in halves:
+        level = _nose_level(arr, half & rostral, half & caudal, background) or common
+        bright = cv2.morphologyEx((half & allowed & (arr >= level)).astype(np.uint8), cv2.MORPH_OPEN, ell)
+        n, labels, _, _ = cv2.connectedComponentsWithStats(bright, connectivity=8)
+        nose_rostral = half & rostral
+        keep = np.zeros_like(blob_mask, dtype=bool)
+        for lab in range(1, n):
+            comp = labels == lab
+            if (comp & nose_rostral).sum() >= 0.1 * max(nose_rostral.sum(), 1):
+                keep |= comp
+        if not keep.any():
+            out.append(_largest_component(half & rostral))
+            continue
+        cols = np.nonzero((half & allowed).any(axis=0))[0]
+        bottom = np.full(len(cols), np.nan)
+        for i, x in enumerate(cols):
+            yy = np.nonzero(keep[:, x])[0]
+            if len(yy):
+                bottom[i] = yy.max()
+        ok = ~np.isnan(bottom)
+        bottom = np.interp(np.arange(len(cols)), np.nonzero(ok)[0], bottom[ok])
+        bottom = _cut_narrow_spikes(bottom, max(9, int(len(cols) * NOSE_SPIKE_FRACTION)))
+        # и не глубже типичного низа этой половины (наискосок идущий хвост вдоль
+        # изогнутой перегородки узким пиком по столбцам не выглядит)
+        bottom = np.minimum(bottom, np.percentile(bottom, 70) + 0.1 * nose_len)
+        bottom = _smooth_rows(bottom, NOSE_BOTTOM_SMOOTH_PX)
+        above = np.zeros_like(blob_mask, dtype=bool)
+        rows = np.arange(blob_mask.shape[0])[:, None]
+        above[:, cols] = rows <= np.round(bottom)[None, :]
+        out.append(_largest_component(half & allowed & above))
+    return out
 
 
 def _background_level(image: np.ndarray, blobs: list[Blob]) -> float:
@@ -882,18 +907,12 @@ def build_masks_for_image(
         # нос: нижний край по яркости (если нос заметно ярче черепа), иначе прямой
         # отрез по «талии». Линии отреза у масок носа нет — после деления на половины
         # и границы по яркости она ничего не определяла, только мешала (сессия 9)
-        nose = nose_by_brightness(image, blob.mask, cut_line, anchor, background)
-        if nose is None:
-            nose = rostral_mask
         halves = split_left_right(image, blob.mask)[:2]
-        for side, half in enumerate(halves):
-            masks.append(
-                SpecimenMask(
-                    animal_index=animal_index,
-                    slice_index=side,
-                    mask=_largest_component(half & nose),
-                )
-            )
+        noses = nose_halves(image, blob.mask, halves, cut_line, anchor, background)
+        if noses is None:
+            noses = [_largest_component(h & rostral_mask) for h in halves]
+        for side, nose in enumerate(noses):
+            masks.append(SpecimenMask(animal_index=animal_index, slice_index=side, mask=nose))
 
     if poorly_elongated_animals:
         note = (
