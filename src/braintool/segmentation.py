@@ -524,120 +524,26 @@ def compute_rostral_cut(
     return rostral_mask, (p1, p2), is_elongated
 
 
-# Деление носа на левую и правую половину (сессия 9). Посередине носа тянется
-# тёмная перегородка — её ищем как непрерывный путь сверху вниз по самым тёмным
-# пикселям, но только в центральной части ширины черепа (края пятна тоже тёмные,
-# путь не должен уйти на край). Доля ширины, в пределах которой ищется путь:
-MIDLINE_SEARCH_FRACTION = 0.3
-# штраф за удаление пути от центра строки (в долях яркости строки) — чтобы на
-# участках без выраженной борозды путь шёл посередине, а не петлял по шуму
-MIDLINE_CENTER_PENALTY = 0.3
-# штраф за боковой шаг пути между соседними строками — борозда прямая или плавно
-# изогнутая, без этого путь «ступенькой» перескакивает на соседние тёмные пятна
-MIDLINE_STEP_PENALTY = 0.08
-# окно сглаживания пути и ширины тёмной полосы по вертикали (строк)
-MIDLINE_SMOOTH_ROWS = 15
-# какая верхняя доля высоты черепа используется для проведения средней линии
-MIDLINE_FIT_FRACTION = 0.6
-# насколько далеко от пути может простираться вырезаемая тёмная полоса (доля ширины)
-MIDLINE_GAP_MAX_FRACTION = 0.08
-# тёмная полоса = пиксели темнее, чем середина между дном борозды и яркостью по бокам
-MIDLINE_GAP_LEVEL = 0.5
-# если дно борозды темнее боков меньше чем на эту долю — тёмной полосы нет, между
-# масками остаётся только линия раздела в 1 пиксель
-MIDLINE_MIN_CONTRAST = 0.1
+# ---------- Нос: левая и правая половина (сессия 9) ----------
+# Половины строятся симметрично ПО ПОСТРОЕНИЮ: ось — ось зеркальной симметрии формы
+# передней части черепа (не по яркости — яркость и есть измеряемый сигнал), бока —
+# край ткани своей стороны, низ — по яркости, но общий для обеих сторон (профиль
+# левой стороны и зеркально отражённой правой усредняются). Прежние варианты (путь по
+# тёмной борозде, низ по яркости каждой стороны отдельно) на фото лаборатории давали
+# половины разного размера и теряли край (скрины 569–571).
 
-
-
-def _row_extent(blob_mask: np.ndarray) -> dict[int, tuple[int, int]]:
-    extent = {}
-    for y in np.nonzero(blob_mask.any(axis=1))[0]:
-        xs = np.nonzero(blob_mask[y])[0]
-        extent[int(y)] = (int(xs.min()), int(xs.max()))
-    return extent
-
-
-def find_midline(image: np.ndarray, blob_mask: np.ndarray) -> dict[int, int]:
-    """Средняя линия черепа по тёмной срединной борозде: {y: x} для каждой строки пятна.
-
-    Сначала путь динамическим программированием по строкам сверху вниз (как «шов»
-    при content-aware resize): от строки к строке путь сдвигается не больше чем на
-    1 пиксель, стоимость пикселя — его яркость относительно средней яркости
-    строки плюс штраф за удаление от центра строки. Ищем только в центральной
-    полосе шириной MIDLINE_SEARCH_FRACTION от ширины черепа. Затем через путь
-    проводится плавная кривая (см. ниже) — она и возвращается.
-    """
-    arr = cv2.GaussianBlur(image.astype(np.float32), (0, 0), 1.5)
-    extent = _row_extent(blob_mask)
-    if not extent:
-        return {}
-    ys = sorted(extent)
-    x_lo, x_hi = min(e[0] for e in extent.values()), max(e[1] for e in extent.values())
-    width = x_hi - x_lo + 1
-    xs = np.arange(x_lo, x_hi + 1)
-    # центр строки сглажен по вертикали — у кончика носа и у неровного края
-    # отдельные строки кривые
-    centers = np.array([(extent[y][0] + extent[y][1]) / 2 for y in ys])
-    k = max(3, len(ys) // 15)
-    centers = np.convolve(np.pad(centers, k, mode="edge"), np.ones(2 * k + 1) / (2 * k + 1), mode="same")[k:-k]
-    half_band = max(3.0, width * MIDLINE_SEARCH_FRACTION / 2)
-
-    big = 1e9
-    cost = np.full((len(ys), width), big)
-    for i, y in enumerate(ys):
-        row = arr[y, x_lo : x_hi + 1]
-        inside = blob_mask[y, x_lo : x_hi + 1]
-        ref = float(row[inside].mean()) or 1.0
-        dist = np.abs(xs - centers[i])
-        ok = inside & (dist <= half_band)
-        if not ok.any():
-            ok = dist <= max(1.0, dist.min())
-        cost[i, ok] = row[ok] / ref + MIDLINE_CENTER_PENALTY * (dist[ok] / half_band) ** 2
-
-    acc = cost.copy()
-    back = np.zeros_like(acc, dtype=np.int64)
-    for i in range(1, len(ys)):
-        prev = acc[i - 1]
-        step = MIDLINE_STEP_PENALTY
-        cand = np.stack([np.r_[big, prev[:-1]] + step, prev, np.r_[prev[1:], big] + step])
-        choice = np.argmin(cand, axis=0)
-        acc[i] += cand[choice, np.arange(width)]
-        back[i] = np.arange(width) + choice - 1
-
-    raw = np.zeros(len(ys))
-    j = int(np.argmin(acc[-1]))
-    for i in range(len(ys) - 1, -1, -1):
-        raw[i] = x_lo + j
-        j = int(back[i, j])
-    # путь по яркости местами виляет на соседние тёмные пятна, поэтому через него
-    # проводится плавная кривая (парабола — нос бывает слегка изогнут вбок, прямая
-    # тогда отдаёт кончик носа целиком одной стороне). Берём верхние
-    # MIDLINE_FIT_FRACTION строк черепа (нос и чуть ниже): в мозговой коробке свои
-    # тёмные детали, которые не должны тянуть линию; ниже — продолжение по касательной
-    ys_arr = np.array(ys, dtype=np.float64)
-    fit_end = ys_arr[0] + (ys_arr[-1] - ys_arr[0]) * MIDLINE_FIT_FRACTION
-    use = ys_arr <= fit_end
-    if use.sum() < 5:
-        use[:] = True
-    fy, fx = ys_arr[use], raw[use]
-    deg = 2 if len(fy) >= 15 else 1
-    coef = np.polyfit(fy, fx, deg)
-    for _ in range(3):
-        resid = np.abs(fx - np.polyval(coef, fy))
-        cut = max(2.0, 2.5 * 1.4826 * float(np.median(resid)))
-        keep = resid <= cut
-        if keep.sum() < 5:
-            break
-        coef = np.polyfit(fy[keep], fx[keep], deg)
-    y_end = float(fy.max())
-    x_end = float(np.polyval(coef, y_end))
-    slope_end = float(np.polyval(np.polyder(coef), y_end))
-    curve = np.where(ys_arr <= y_end, np.polyval(coef, ys_arr), x_end + slope_end * (ys_arr - y_end))
-    return {y: int(round(x)) for y, x in zip(ys, curve)}
+# наклон оси (px по x на px по y) и сдвиг от центра (доля ширины), в которых ищется ось
+AXIS_MAX_SLOPE = 0.35
+AXIS_MAX_SHIFT_FRACTION = 0.2
+# половина ширины разреза между половинами, px (перегородка/клин вырезаются отдельно —
+# нижним краем по яркости)
+MIDLINE_GAP_PX = 1
+# доля нижних пикселей строки, в которых ищется ось: берём нос и чуть ниже «талии»
+AXIS_FIT_BELOW_CUT_FRACTION = 0.3
 
 
 def _smooth_rows(values: np.ndarray, window: int) -> np.ndarray:
-    """Медиана (убирает одиночные выбросы) + скользящее среднее по строкам."""
+    """Медиана (убирает одиночные выбросы) + скользящее среднее."""
     if len(values) < 3:
         return values.astype(np.float64)
     h = min(window // 2, (len(values) - 1) // 2)
@@ -647,92 +553,43 @@ def _smooth_rows(values: np.ndarray, window: int) -> np.ndarray:
     return np.convolve(padded, np.ones(2 * h + 1) / (2 * h + 1), mode="valid")
 
 
-def split_left_right(
-    image: np.ndarray, blob_mask: np.ndarray
-) -> tuple[np.ndarray, np.ndarray, dict[int, int]]:
-    """Делит пятно черепа на левую и правую половину по срединной борозде.
+def symmetry_axis(region: np.ndarray) -> tuple[float, float]:
+    """Ось зеркальной симметрии области (нос черепа): x = a + b·y.
 
-    Тёмная полоса вдоль борозды (перегородка между половинами носа) не входит ни в
-    одну маску — маски обходят её по краю. Ширина полосы своя в каждой строке:
-    пиксели около средней линии, которые темнее середины между дном борозды и
-    яркостью по бокам от неё, но не дальше MIDLINE_GAP_MAX_FRACTION ширины черепа от
-    линии. Дно борозды в маски не входит никогда (минимальный зазор — 1 пиксель).
-    """
-    path = find_midline(image, blob_mask)
-    left = np.zeros_like(blob_mask, dtype=bool)
-    right = np.zeros_like(blob_mask, dtype=bool)
-    if not path:
-        return left, right, path
-    arr = cv2.GaussianBlur(image.astype(np.float32), (0, 0), 1.0)
-    xs_all = np.nonzero(blob_mask.any(axis=0))[0]
-    width = int(xs_all.max() - xs_all.min() + 1)
-    max_gap = max(2, int(round(width * MIDLINE_GAP_MAX_FRACTION)))
-    flank_w = max(3, max_gap)
-
-    # в каждой строке рядом с линией ищем дно борозды и от него — края тёмной
-    # полосы; края затем сглаживаются по вертикали, чтобы контур масок вдоль
-    # перегородки был ровным, без «пилы»
-    ys = sorted(path)
-    edges = np.zeros((len(ys), 2))
-    for i, y in enumerate(ys):
-        xm = path[y]
-        row = arr[y]
-        inside = blob_mask[y]
-        lo, hi = max(0, xm - max_gap // 2), min(len(row) - 1, xm + max_gap // 2)
-        xv = lo + int(np.argmin(row[lo : hi + 1]))
-        valley = float(row[xv])
-        flanks = []
-        for a, b in ((xm - max_gap - flank_w, xm - max_gap), (xm + max_gap, xm + max_gap + flank_w)):
-            a, b = max(0, a), min(len(row), b)
-            sel = inside[a:b]
-            if sel.any():
-                flanks.append(float(np.median(row[a:b][sel])))
-        flank = min(flanks) if flanks else valley
-        level = valley + MIDLINE_GAP_LEVEL * (flank - valley)
-        if flank - valley < MIDLINE_MIN_CONTRAST * max(flank, 1e-6):
-            level = valley   # борозды здесь не видно — только тонкая линия раздела
-        for k, step in enumerate((-1, 1)):
-            x = xv + step
-            while abs(x - xm) <= max_gap and 0 <= x < len(row) and row[x] < level:
-                x += step
-            edges[i, k] = x - step
-    edges = np.column_stack([_smooth_rows(edges[:, k], MIDLINE_SMOOTH_ROWS) for k in range(2)])
-
-    cols = np.arange(blob_mask.shape[1])[None, :]
-    gap_a = np.full(blob_mask.shape[0], -1.0)
-    gap_b = np.full(blob_mask.shape[0], -1.0)
-    for i, y in enumerate(ys):
-        gap_a[y] = np.floor(edges[i, 0])
-        gap_b[y] = np.ceil(edges[i, 1])
-    rows_with_path = gap_a >= 0
-    is_left = (cols < gap_a[:, None]) & rows_with_path[:, None]
-    is_right = (cols > gap_b[:, None]) & rows_with_path[:, None]
-    gap = rows_with_path[:, None] & ~is_left & ~is_right
-    body = blob_mask & ~gap
-    left = _largest_component(body & is_left)
-    right = _largest_component(body & is_right)
-    return left, right, path
+    Перебор наклона и сдвига; для каждой оси по строкам сравнивается отрезок ткани
+    [l, r] с его отражением [2c−r, 2c−l] (c — точка оси в этой строке), оценка —
+    суммарное пересечение / объединение. Нос лежит носом вверх, поэтому ось почти
+    вертикальна (|b| ≤ AXIS_MAX_SLOPE)."""
+    rows = np.nonzero(region.any(axis=1))[0]
+    ls = np.array([np.argmax(region[y]) for y in rows], dtype=np.float64)
+    rs = np.array([region.shape[1] - 1 - np.argmax(region[y][::-1]) for y in rows], dtype=np.float64)
+    mids = (ls + rs) / 2
+    width = float(np.median(rs - ls)) + 1
+    y0 = float(np.median(rows))
+    base = float(np.median(mids))
+    best, best_score = (base, 0.0), -1.0
+    for b in np.linspace(-AXIS_MAX_SLOPE, AXIS_MAX_SLOPE, 29):
+        for da in np.linspace(-AXIS_MAX_SHIFT_FRACTION, AXIS_MAX_SHIFT_FRACTION, 33) * width:
+            c = base + da + b * (rows - y0)
+            ml, mr = 2 * c - rs, 2 * c - ls
+            inter = np.clip(np.minimum(rs, mr) - np.maximum(ls, ml) + 1, 0, None).sum()
+            union = (rs - ls + 1).sum() + (mr - ml + 1).sum() - inter
+            score = inter / max(union, 1)
+            if score > best_score:
+                best_score, best = score, (base + da - b * y0, b)
+    return best
 
 
-# Нижний край носа по яркости (сессия 9, по скриншотам пользователя): нос заметно ярче
-# остального черепа, и его низ — это переход яркого в тусклое (закруглённые доли, тёмный
-# клин между ними), а не прямая. Бока и кончик — по краю ткани целиком: граница по
-# яркости со всех сторон теряла тусклый ободок и делала тусклую половину меньше яркой
-# (скрины 569–570). Порог — посередине между медианой носа и медианой остального черепа
-# своей половины, так что более яркая сторона не получает маску больше.
 NOSE_LEVEL = 0.5
 # если нос ярче остального черепа меньше чем во столько раз (оба — за вычетом фона
-# камеры) — граница по яркости ненадёжна, остаётся прямой отрез по «талии». Без
-# вычета фона (~43 из 255 на фото LbL) тусклые черепа всегда уходили в прямой отрез
+# камеры) — низ по яркости ненадёжен, низ — прямая по «талии»
 NOSE_MIN_CONTRAST = 1.3
-# насколько ниже найденной «талии» может уходить яркий нос (доля длины носа) — дальше
-# яркое уже не считается носом. 35% обрезало закруглённый низ долей по прямой
+# насколько ниже «талии» может уходить яркий нос (доля длины носа)
 NOSE_EXTEND_FRACTION = 0.5
-# окно сглаживания нижнего края по столбцам (px): меньше — рваный край, больше —
-# заплывает тёмный клин между долями
+# сглаживание нижнего края по расстоянию от оси (px)
 NOSE_BOTTOM_SMOOTH_PX = 7
-# узкие выступы нижнего края вниз (яркая полоска вдоль перегородки) уже этой доли
-# ширины половины срезаются; узкие вырезы вверх (тёмный клин) остаются
+# узкие выступы нижнего края вниз уже этой доли ширины половины срезаются; узкие
+# вырезы вверх (тёмный клин у оси) остаются
 NOSE_SPIKE_FRACTION = 0.35
 
 
@@ -763,74 +620,87 @@ def _nose_level(arr, rostral, caudal, background) -> float | None:
     return rest_med + NOSE_LEVEL * (nose_med - rest_med)
 
 
+def _bottom_profile(bright: np.ndarray, dist: np.ndarray, side_mask: np.ndarray, n: int) -> np.ndarray:
+    """Нижний край яркого по расстоянию от оси (0..n−1): самая нижняя строка."""
+    prof = np.full(n, np.nan)
+    ys, xs = np.nonzero(bright & side_mask)
+    if len(ys) == 0:
+        return prof
+    d = np.clip(dist[ys, xs].astype(int), 0, n - 1)
+    np.fmax.at(prof, d, ys.astype(np.float64))
+    return prof
+
+
 def nose_halves(
     image: np.ndarray,
     blob_mask: np.ndarray,
-    halves: list[np.ndarray],
     cut_line: tuple[tuple[float, float], tuple[float, float]],
     anchor: tuple[float, float],
     background: float,
-) -> list[np.ndarray] | None:
-    """Нос по половинам: всё, что в половине черепа выше нижнего края носа.
-
-    Нижний край ищется по столбцам: в каждом столбце — самая нижняя точка яркой
-    части носа (ярче порога своей половины, связана с носом выше «талии», не ниже
-    ограничителя — «талии», сдвинутой вниз на NOSE_EXTEND_FRACTION длины носа).
-    В столбцах без яркого (тусклый ободок у края) край продолжается от соседних,
-    затем сглаживается. Бока и кончик остаются по краю ткани; тёмный клин между
-    долями снизу выпадает сам (в его столбцах яркое кончается выше).
-    None — нос не ярче остального черепа настолько, чтобы край по яркости был надёжен.
-    """
-    arr = cv2.GaussianBlur(image.astype(np.float32), (0, 0), 2.0)
+) -> list[np.ndarray]:
+    """Левая и правая половина носа черепа (см. комментарий к блоку выше)."""
+    h, w = blob_mask.shape
     rostral = recompute_rostral_mask_from_line(blob_mask, cut_line, anchor)
-    caudal = blob_mask & ~rostral
-    common = _nose_level(arr, rostral, caudal, background)
-    if common is None:
-        return None
-
     p1, p2 = np.array(cut_line[0]), np.array(cut_line[1])
     normal = np.array([-(p2 - p1)[1], (p2 - p1)[0]])
     normal /= max(np.linalg.norm(normal), 1e-9)
     if np.dot(np.array(anchor) - p1, normal) > 0:
-        normal = -normal   # normal смотрит от носа (вниз по черепу)
+        normal = -normal   # смотрит от носа (вниз по черепу)
     ys, xs = np.nonzero(rostral)
-    nose_len = float(np.max(-((np.column_stack([xs, ys]) - p1) @ normal)))
+    nose_len = float(np.max(-((np.column_stack([xs, ys]) - p1) @ normal))) if len(ys) else 1.0
+    # ось — по носу и чуть ниже «талии» (одна узкая «пипка» кончика её не качает)
+    fit_region = recompute_rostral_mask_from_line(
+        blob_mask, _shift_line(cut_line, normal * nose_len * AXIS_FIT_BELOW_CUT_FRACTION), anchor)
+    a, b = symmetry_axis(fit_region if fit_region.any() else blob_mask)
+    yy, xx = np.mgrid[0:h, 0:w]
+    signed = (xx - (a + b * yy)) / np.sqrt(1 + b * b)
+    dist = np.abs(signed)
+    left_side = signed < -MIDLINE_GAP_PX
+    right_side = signed > MIDLINE_GAP_PX
+
+    arr = cv2.GaussianBlur(image.astype(np.float32), (0, 0), 2.0)
+    caudal = blob_mask & ~rostral
+    common = _nose_level(arr, rostral, caudal, background)
+    if common is None:
+        # нос не ярче черепа — низ по «талии», перпендикулярно оси
+        return [_largest_component(rostral & s) for s in (left_side, right_side)]
+
     limit_line = _shift_line(cut_line, normal * nose_len * NOSE_EXTEND_FRACTION)
     allowed = recompute_rostral_mask_from_line(blob_mask, limit_line, anchor)
     ell = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-
-    out = []
-    for half in halves:
-        level = _nose_level(arr, half & rostral, half & caudal, background) or common
-        bright = cv2.morphologyEx((half & allowed & (arr >= level)).astype(np.uint8), cv2.MORPH_OPEN, ell)
-        n, labels, _, _ = cv2.connectedComponentsWithStats(bright, connectivity=8)
-        nose_rostral = half & rostral
-        keep = np.zeros_like(blob_mask, dtype=bool)
-        for lab in range(1, n):
+    n = int(dist[blob_mask].max()) + 2 if blob_mask.any() else 2
+    profiles = []
+    for side in (left_side, right_side):
+        # порог своей стороны — более яркая сторона не получает нос глубже
+        level = _nose_level(arr, rostral & side, caudal & side, background) or common
+        bright = cv2.morphologyEx((allowed & side & (arr >= level)).astype(np.uint8), cv2.MORPH_OPEN, ell) > 0
+        nlab, labels = cv2.connectedComponents(bright.astype(np.uint8), connectivity=8)
+        keep = np.zeros_like(bright)
+        side_rostral = rostral & side
+        for lab in range(1, nlab):
             comp = labels == lab
-            if (comp & nose_rostral).sum() >= 0.1 * max(nose_rostral.sum(), 1):
+            if (comp & side_rostral).sum() >= 0.1 * max(side_rostral.sum(), 1):
                 keep |= comp
-        if not keep.any():
-            out.append(_largest_component(half & rostral))
-            continue
-        cols = np.nonzero((half & allowed).any(axis=0))[0]
-        bottom = np.full(len(cols), np.nan)
-        for i, x in enumerate(cols):
-            yy = np.nonzero(keep[:, x])[0]
-            if len(yy):
-                bottom[i] = yy.max()
-        ok = ~np.isnan(bottom)
-        bottom = np.interp(np.arange(len(cols)), np.nonzero(ok)[0], bottom[ok])
-        bottom = _cut_narrow_spikes(bottom, max(9, int(len(cols) * NOSE_SPIKE_FRACTION)))
-        # и не глубже типичного низа этой половины (наискосок идущий хвост вдоль
-        # изогнутой перегородки узким пиком по столбцам не выглядит)
-        bottom = np.minimum(bottom, np.percentile(bottom, 70) + 0.1 * nose_len)
-        bottom = _smooth_rows(bottom, NOSE_BOTTOM_SMOOTH_PX)
-        above = np.zeros_like(blob_mask, dtype=bool)
-        rows = np.arange(blob_mask.shape[0])[:, None]
-        above[:, cols] = rows <= np.round(bottom)[None, :]
-        out.append(_largest_component(half & allowed & above))
-    return out
+        profiles.append(_bottom_profile(keep, dist, side, n))
+    # общий низ: среднее двух сторон там, где есть обе, иначе та, что есть
+    stack = np.vstack(profiles)
+    cnt = np.isfinite(stack).sum(axis=0)
+    prof = np.where(cnt > 0, np.nansum(stack, axis=0) / np.maximum(cnt, 1), np.nan)
+    if prof is None or not np.isfinite(prof).any():
+        return [_largest_component(rostral & s) for s in (left_side, right_side)]
+    # внешние расстояния без яркого (тусклый ободок) — продолжают соседние
+    widths = dist[blob_mask & allowed]
+    extent = int(np.percentile(widths, 99)) + 2 if len(widths) else n
+    prof = prof[:extent]
+    ok = np.isfinite(prof)
+    prof = np.interp(np.arange(len(prof)), np.nonzero(ok)[0], prof[ok])
+    prof = _cut_narrow_spikes(prof, max(9, int(len(prof) * NOSE_SPIKE_FRACTION)))
+    prof = np.minimum(prof, np.percentile(prof, 70) + 0.1 * nose_len)
+    prof = _smooth_rows(prof, NOSE_BOTTOM_SMOOTH_PX)
+    prof = np.r_[prof, np.full(n - len(prof), prof[-1])]
+    bottom = prof[np.clip(dist.astype(int), 0, n - 1)]
+    above = yy <= bottom
+    return [_largest_component(blob_mask & allowed & above & s) for s in (left_side, right_side)]
 
 
 def _background_level(image: np.ndarray, blobs: list[Blob]) -> float:
@@ -907,10 +777,7 @@ def build_masks_for_image(
         # нос: нижний край по яркости (если нос заметно ярче черепа), иначе прямой
         # отрез по «талии». Линии отреза у масок носа нет — после деления на половины
         # и границы по яркости она ничего не определяла, только мешала (сессия 9)
-        halves = split_left_right(image, blob.mask)[:2]
-        noses = nose_halves(image, blob.mask, halves, cut_line, anchor, background)
-        if noses is None:
-            noses = [_largest_component(h & rostral_mask) for h in halves]
+        noses = nose_halves(image, blob.mask, cut_line, anchor, background)
         for side, nose in enumerate(noses):
             masks.append(SpecimenMask(animal_index=animal_index, slice_index=side, mask=nose))
 
