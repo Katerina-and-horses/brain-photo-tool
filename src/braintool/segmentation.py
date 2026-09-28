@@ -718,12 +718,13 @@ def split_left_right(
 # остального черепа, и его нижний край — это переход яркого в тусклое, а не прямая.
 # Порог — посередине между медианой носа и медианой остального черепа.
 NOSE_LEVEL = 0.5
-# если нос ярче остального черепа меньше чем во столько раз — граница по яркости
-# ненадёжна, остаётся прямая линия отреза
-NOSE_MIN_CONTRAST = 1.25
-# насколько ниже найденной «талии» может уходить яркий нос (доля длины носа) — там
-# проходит линия отреза-ограничитель, её можно перетащить выше
-NOSE_EXTEND_FRACTION = 0.35
+# если нос ярче остального черепа меньше чем во столько раз (оба — за вычетом фона
+# камеры) — граница по яркости ненадёжна, остаётся прямой отрез по «талии». Без
+# вычета фона (~43 из 255 на фото LbL) тусклые черепа всегда уходили в прямой отрез
+NOSE_MIN_CONTRAST = 1.3
+# насколько ниже найденной «талии» может уходить яркий нос (доля длины носа) — дальше
+# яркое уже не считается носом. 35% обрезало закруглённый низ долей по прямой
+NOSE_EXTEND_FRACTION = 0.5
 # кончик носа тусклее середины, но в нос входит: верхняя доля длины носа берётся по
 # контуру черепа целиком, яркость решает только, где нос кончается снизу
 NOSE_TIP_FRACTION = 0.4
@@ -739,8 +740,9 @@ def nose_by_brightness(
     blob_mask: np.ndarray,
     cut_line: tuple[tuple[float, float], tuple[float, float]],
     anchor: tuple[float, float],
-) -> tuple[np.ndarray, tuple[tuple[float, float], tuple[float, float]]] | None:
-    """Яркая носовая часть черепа: (маска, линия-ограничитель снизу).
+    background: float,
+) -> np.ndarray | None:
+    """Яркая носовая часть черепа.
 
     Порог — посередине между медианой яркости выше «талии» (`compute_rostral_cut`)
     и ниже неё. Берётся яркое, связанное с носом, не ниже линии отреза, сдвинутой
@@ -753,10 +755,12 @@ def nose_by_brightness(
     caudal = blob_mask & ~rostral
     if rostral.sum() < 50 or caudal.sum() < 50:
         return None
-    nose_med = float(np.median(arr[rostral]))
-    rest_med = float(np.median(arr[caudal]))
+    nose_med = float(np.median(arr[rostral])) - background
+    rest_med = float(np.median(arr[caudal])) - background
     if nose_med < NOSE_MIN_CONTRAST * max(rest_med, 1e-6):
         return None
+    nose_med += background
+    rest_med += background
     level = rest_med + NOSE_LEVEL * (nose_med - rest_med)
 
     # линия-ограничитель: та же «талия», сдвинутая от носа на долю его длины
@@ -801,7 +805,17 @@ def nose_by_brightness(
     keep_u8 = cv2.morphologyEx(keep.astype(np.uint8), cv2.MORPH_OPEN, smooth)
     keep_u8 = cv2.morphologyEx(keep_u8, cv2.MORPH_CLOSE, smooth)
     keep = (keep_u8 > 0) & blob_mask
-    return keep & allowed, limit_line
+    return keep & allowed
+
+
+def _background_level(image: np.ndarray, blobs: list[Blob]) -> float:
+    """Фон камеры: медиана кадра вдали от найденных пятен."""
+    arr = cv2.GaussianBlur(image.astype(np.float32), (0, 0), 2.0)
+    near = np.zeros(image.shape[:2], dtype=np.uint8)
+    for b in blobs:
+        near |= b.mask.astype(np.uint8)
+    far = cv2.dilate(near, np.ones((31, 31), np.uint8)) == 0
+    return float(np.median(arr[far])) if far.any() else float(np.median(arr))
 
 
 def _largest_component(mask: np.ndarray) -> np.ndarray:
@@ -848,6 +862,7 @@ def build_masks_for_image(
     # ROSTRAL_CUT: у каждого животного две маски — левая (slice_index 0) и правая (1)
     # половина носа, тёмная перегородка посередине не входит ни в одну (сессия 9)
     poorly_elongated_animals: list[int] = []
+    background = _background_level(image, blobs)
     for animal_index in range(group.cols):
         blob = assignment.get((animal_index, 0))
         if blob is None:
@@ -864,30 +879,19 @@ def build_masks_for_image(
         if not is_elongated:
             poorly_elongated_animals.append(animal_index + 1)
         anchor = _mask_centroid(rostral_mask)
-        # половины делятся по всему черепу, а нос из них вырезается той же линией
-        # отреза — так при перетаскивании линии каждая половина пересчитывается
-        # от своей половины черепа (source_blob) и перегородка остаётся вырезанной
+        # нос: нижний край по яркости (если нос заметно ярче черепа), иначе прямой
+        # отрез по «талии». Линии отреза у масок носа нет — после деления на половины
+        # и границы по яркости она ничего не определяла, только мешала (сессия 9)
+        nose = nose_by_brightness(image, blob.mask, cut_line, anchor, background)
+        if nose is None:
+            nose = rostral_mask
         halves = split_left_right(image, blob.mask)[:2]
-        # нижний край носа — по яркости, линия отреза тогда лишь ограничитель снизу
-        # (её можно перетащить выше); если нос не ярче черепа — прежняя прямая линия
-        bright = nose_by_brightness(image, blob.mask, cut_line, anchor)
-        if bright is not None:
-            nose_region, cut_line = bright
-            # source_blob половины: выше линии — яркий нос, ниже — череп целиком, чтобы
-            # линию можно было и поднять (обрезать нос), и опустить (добавить череп)
-            above = recompute_rostral_mask_from_line(blob.mask, cut_line, anchor)
-            halves = [h & (nose_region | ~above) for h in halves]
-            halves = [h & ~above | _largest_component(h & above) for h in halves]
         for side, half in enumerate(halves):
-            half_nose = recompute_rostral_mask_from_line(half, cut_line, anchor)
             masks.append(
                 SpecimenMask(
                     animal_index=animal_index,
                     slice_index=side,
-                    mask=half_nose,
-                    cut_line=cut_line,
-                    source_blob=half,
-                    rostral_anchor=anchor,
+                    mask=_largest_component(half & nose),
                 )
             )
 
@@ -937,49 +941,101 @@ def recompute_rostral_mask_from_line(
     return out
 
 
-# Максимум вершин полигона при авто-упрощении контура. Больше — таскать мышью
-# неудобно (частокол ручек), меньше — форма грубеет и теряет вогнутости (например,
-# "запятую" носовой полости уже не изобразить). Число подобрано на глаз как разумный
-# компромисс, не измерялось на реальных фото пользователя.
-POLYGON_MAX_POINTS = 40
+# Контур для правки точками (с сессии 9): между точками — плавная кривая, а не прямые
+# отрезки, поэтому закругления держатся на немногих точках. Точек берётся столько,
+# сколько нужно, чтобы кривая совпала с маской (POLYGON_FIT_IOU), но не больше
+# POLYGON_MAX_POINTS. Раньше было до 40 точек с прямыми рёбрами — на фото с пятью
+# носами по две половины выходило ~400 точек, «непонятно, какие тянуть».
+POLYGON_MAX_POINTS = 24
+POLYGON_MIN_POINTS = 6
+POLYGON_FIT_IOU = 0.95
+# сколько точек кривой рисуется/растеризуется на каждое ребро между вершинами
+CURVE_SAMPLES_PER_EDGE = 12
+
+
+def smooth_curve(
+    polygon: list[tuple[float, float]], samples: int = CURVE_SAMPLES_PER_EDGE
+) -> np.ndarray:
+    """Замкнутая плавная кривая через вершины полигона (центростремительный
+    Catmull-Rom: проходит точно через каждую вершину, без петель и выбросов на
+    острых углах). Возвращает массив (N·samples, 2); ребро i — строки
+    [i·samples, (i+1)·samples)."""
+    pts = np.asarray(polygon, dtype=np.float64)
+    n = len(pts)
+    if n < 3:
+        return pts
+    out = np.empty((n * samples, 2))
+    t = np.linspace(0.0, 1.0, samples, endpoint=False)[:, None]
+    for i in range(n):
+        p0, p1, p2, p3 = pts[(i - 1) % n], pts[i], pts[(i + 1) % n], pts[(i + 2) % n]
+        d01 = max(np.linalg.norm(p1 - p0) ** 0.5, 1e-6)
+        d12 = max(np.linalg.norm(p2 - p1) ** 0.5, 1e-6)
+        d23 = max(np.linalg.norm(p3 - p2) ** 0.5, 1e-6)
+        # касательные в p1 и p2 (формула Barry–Goldman, переписанная через Эрмита)
+        m1 = (p1 - p0) / d01 - (p2 - p0) / (d01 + d12) + (p2 - p1) / d12
+        m2 = (p2 - p1) / d12 - (p3 - p1) / (d12 + d23) + (p3 - p2) / d23
+        m1 *= d12
+        m2 *= d12
+        h00 = 2 * t**3 - 3 * t**2 + 1
+        h10 = t**3 - 2 * t**2 + t
+        h01 = -2 * t**3 + 3 * t**2
+        h11 = t**3 - t**2
+        out[i * samples : (i + 1) * samples] = h00 * p1 + h10 * m1 + h01 * p2 + h11 * m2
+    return out
 
 
 def mask_to_polygon(mask: np.ndarray, max_points: int = POLYGON_MAX_POINTS) -> list[tuple[float, float]] | None:
-    """Строит полигон-контур по растровой маске — отправная точка для правки точками:
-    человек подтягивает уже готовый контур, а не обводит форму с нуля.
+    """Строит контур из немногих точек по растровой маске — отправная точка для правки
+    точками: человек подтягивает уже готовый контур, а не обводит форму с нуля.
 
     Возвращает None, если в маске нет ни одного закрашенного пикселя (нечего
     обводить). Если у маски несколько несвязных областей — обводится самая большая
     по площади; остальные при правке точками сохраняются как есть (см.
     `apply_polygon_edit`), но точками не редактируются.
-    `approxPolyDP` упрощает контур со всё бОльшим эпсилон, пока число вершин не
-    уложится в `max_points`.
+    `approxPolyDP` упрощает контур с убывающим эпсилон — берётся первый (самый
+    экономный) набор точек, плавная кривая через который совпадает с маской не хуже
+    POLYGON_FIT_IOU; не больше `max_points`.
     """
-    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not contours:
         return None
     contour = max(contours, key=cv2.contourArea)
     if cv2.contourArea(contour) <= 0:
         return None
+    region = np.zeros(mask.shape, dtype=np.uint8)
+    cv2.drawContours(region, [contour], -1, 1, thickness=cv2.FILLED)
+    region = region.astype(bool)
 
     perimeter = cv2.arcLength(contour, True)
-    epsilon = max(perimeter * 0.002, 0.5)
-    approx = cv2.approxPolyDP(contour, epsilon, True)
-    while len(approx) > max_points:
-        epsilon *= 1.5
+    best = None
+    epsilon = perimeter / 8
+    while epsilon > 0.3:
         approx = cv2.approxPolyDP(contour, epsilon, True)
-        if epsilon > perimeter:  # защита от бесконечного цикла на вырожденном контуре
+        epsilon /= 1.25
+        if len(approx) < POLYGON_MIN_POINTS and epsilon > 0.3:
+            continue
+        if len(approx) > max_points:
             break
-    return [(float(p[0][0]), float(p[0][1])) for p in approx]
+        best = approx
+        poly = [(float(p[0][0]), float(p[0][1])) for p in approx]
+        fitted = polygon_to_mask(poly, mask.shape)
+        iou = (fitted & region).sum() / max((fitted | region).sum(), 1)
+        if iou >= POLYGON_FIT_IOU:
+            break
+    if best is None:   # крошечный контур — берём как есть
+        best = cv2.approxPolyDP(contour, 0.5, True)
+    return [(float(p[0][0]), float(p[0][1])) for p in best]
 
 
 def polygon_to_mask(polygon: list[tuple[float, float]], shape: tuple[int, int]) -> np.ndarray:
-    """Растеризует полигон (вершины по кругу, координаты изображения) в bool-маску
-    заданной формы `shape` (высота, ширина) — источник истины для площади/яркости
-    как и раньше остаётся растровая маска, полигон лишь способ её редактировать."""
+    """Растеризует контур (вершины по кругу, координаты изображения; между ними —
+    плавная кривая `smooth_curve`) в bool-маску формы `shape` (высота, ширина) —
+    источник истины для площади/яркости как и раньше остаётся растровая маска,
+    контур лишь способ её редактировать."""
     out = np.zeros(shape, dtype=np.uint8)
     if len(polygon) >= 3:
-        pts = np.array([[int(round(x)), int(round(y))] for x, y in polygon], dtype=np.int32)
+        curve = smooth_curve(polygon)
+        pts = np.round(curve).astype(np.int32)
         cv2.fillPoly(out, [pts], 1)
     return out.astype(bool)
 
