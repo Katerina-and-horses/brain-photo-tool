@@ -22,7 +22,9 @@ from pathlib import Path
 
 import numpy as np
 
-from .imaging import choose_mask_exposure, contrast_stretch_to_uint8, load_image, scan_group_folder
+from .imaging import (
+    choose_mask_exposure, contrast_stretch_to_uint8, is_reference_file, load_image, scan_group_folder,
+)
 from .models import GroupConfig, MaskMode, ShotReview, SpecimenMask
 
 FORMAT_VERSION = 1
@@ -149,7 +151,14 @@ def load_markup(path: Path) -> LoadedMarkup:
             continue
         shot = shots_by_group[s["group"]].get(s["shot_key"])
         if shot is None:
-            problems.append(f"Группа «{s['group']}», кадр «{s['shot_key']}»: файлов больше нет — пропущен.")
+            if is_reference_file(Path(s["shot_key"])):
+                problems.append(
+                    f"Группа «{s['group']}», кадр «{s['shot_key']}»: это снимок при внешнем свете — "
+                    "с новой версии он не анализируется как кадр (по нему только ищется форма "
+                    "черепов), пропущен."
+                )
+            else:
+                problems.append(f"Группа «{s['group']}», кадр «{s['shot_key']}»: файлов больше нет — пропущен.")
             continue
         exposure = s.get("exposure")
         if exposure not in shot.exposure_files:

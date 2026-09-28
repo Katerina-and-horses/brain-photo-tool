@@ -5,6 +5,7 @@ import re
 from functools import lru_cache
 from pathlib import Path
 
+import cv2
 import numpy as np
 import tifffile
 from PIL import Image
@@ -15,6 +16,16 @@ IMAGE_EXTENSIONS = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
 
 # ищет "exp" + число в имени файла, например ex730em810exp150angle112.tif -> exposure=150
 _EXPOSURE_RE = re.compile(r"exp(\d+)", re.IGNORECASE)
+
+# снимок при внешнем свете: «Reference (Filt695 exp2000).tif», «Ref4000.tif», «ref 1_2exp.tif»
+# (так их называют в лаборатории, 147 папок из 345 на Яндекс.Диске). Это не
+# флуоресценция — анализировать его яркость бессмысленно, но форма черепов на нём
+# видна целиком (сессия 10)
+_REFERENCE_RE = re.compile(r"^\s*ref", re.IGNORECASE)
+
+
+def is_reference_file(path: Path) -> bool:
+    return bool(_REFERENCE_RE.match(Path(path).stem))
 
 # доля пикселей на грани диапазона (>=250 из 255 / >=98% от макс. значения),
 # после которой кадр считается «засвеченным»
@@ -52,6 +63,26 @@ def _read_image(path: Path) -> np.ndarray:
     return arr
 
 
+def load_reference(shot: Shot, shape: tuple[int, ...]) -> np.ndarray | None:
+    """Снимок при внешнем свете для кадра, приведённый к размеру кадра `shape`, или
+    None — если его нет, он не читается или у него другие пропорции (значит, снят
+    не в том же кадре, и совмещать нельзя). Бывает снят в большем разрешении (5472×3672
+    при кадрах 1368×918) — тогда уменьшается."""
+    if shot.reference_file is None:
+        return None
+    try:
+        ref = load_image(shot.reference_file)
+    except Exception:  # noqa: BLE001
+        return None
+    h, w = shape[:2]
+    rh, rw = ref.shape[:2]
+    if (rh, rw) == (h, w):
+        return ref
+    if abs(rw / rh - w / h) > 0.01 * (w / h):
+        return None
+    return cv2.resize(ref.astype(np.float32), (w, h), interpolation=cv2.INTER_AREA)
+
+
 def contrast_stretch_to_uint8(arr: np.ndarray, low_pct: float = 1.0, high_pct: float = 99.5) -> np.ndarray:
     """Растягивает контраст для показа на экране (не влияет на измерения)."""
     arr = arr.astype(np.float32)
@@ -79,15 +110,21 @@ def scan_group_folder(group: GroupConfig) -> list[Shot]:
 
     Файлы, чьё имя отличается только числом после "exp", считаются одним
     кадром с разными выдержками. Если в имени файла нет "exp<число>",
-    файл становится отдельным кадром без выбора экспозиции.
+    файл становится отдельным кадром без выбора экспозиции. Снимки при внешнем
+    свете («Reference…», «Ref…») кадрами не считаются — первый из них становится
+    `reference_file` всех кадров группы.
     """
     files = sorted(
         p for p in group.folder.iterdir()
         if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
     )
 
+    references = [p for p in files if is_reference_file(p)]
+    reference = references[0] if references else None
     shots: dict[str, Shot] = {}
     for path in files:
+        if path in references:
+            continue
         match = _EXPOSURE_RE.search(path.stem)
         if match:
             exposure = int(match.group(1))
@@ -96,7 +133,7 @@ def scan_group_folder(group: GroupConfig) -> list[Shot]:
             exposure = 0
             key = path.stem
 
-        shot = shots.setdefault(key, Shot(group=group, shot_key=key))
+        shot = shots.setdefault(key, Shot(group=group, shot_key=key, reference_file=reference))
         shot.exposure_files[exposure] = path
 
     return [shots[k] for k in sorted(shots.keys())]

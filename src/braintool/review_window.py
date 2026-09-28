@@ -28,7 +28,7 @@ from .editing import (
 )
 from .folders import SUBFOLDER_TITLES, data_dir_for, find_group_folders
 from .imaging import (
-    MASK_SATURATION_FRACTION_LIMIT, choose_mask_exposure, contrast_stretch_to_uint8, load_image,
+    MASK_SATURATION_FRACTION_LIMIT, choose_mask_exposure, contrast_stretch_to_uint8, load_image, load_reference,
     mask_saturation_fraction, scan_group_folder, unsaturated_exposures,
 )
 from .measurements import export_table, measure_shot, per_animal_average, rows_to_dataframe
@@ -871,7 +871,8 @@ class ReviewTab(QWidget):
         review.shot.chosen_exposure = exposure
         if clicked is redo_btn:
             self.canvas.push_undo()
-            masks, warning = build_masks_for_image(image, review.shot.group)
+            masks, warning = build_masks_for_image(
+                image, review.shot.group, load_reference(review.shot, image.shape))
             review.masks[:] = masks
             review.warning = warning
         self._show_current(keep_view=True)
@@ -915,7 +916,8 @@ class ReviewTab(QWidget):
             if box.exec() != QMessageBox.StandardButton.Yes:
                 return
         self.canvas.push_undo()
-        masks, warning = build_masks_for_image(review.image, review.shot.group)
+        masks, warning = build_masks_for_image(
+            review.image, review.shot.group, load_reference(review.shot, review.image.shape))
         review.masks[:] = masks
         review.warning = warning
         self._show_current(keep_view=True)
@@ -1747,7 +1749,7 @@ class PipelineTabs(QTabWidget):
                     exposure = choose_mask_exposure(shot)
                     shot.chosen_exposure = exposure
                     image = load_image(shot.exposure_files[exposure])
-                    masks, warning = build_masks_for_image(image, group)
+                    masks, warning = build_masks_for_image(image, group, load_reference(shot, image.shape))
                     display = contrast_stretch_to_uint8(image)
                 except Exception as exc:  # noqa: BLE001
                     problems.append(
