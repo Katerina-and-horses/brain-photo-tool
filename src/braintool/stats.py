@@ -1,6 +1,7 @@
 """Сравнение групп: Манн-Уитни для двух групп, Краскел-Уоллис для трёх и более."""
 from __future__ import annotations
 
+import textwrap
 from dataclasses import dataclass
 from itertools import combinations
 from pathlib import Path
@@ -122,7 +123,8 @@ def _build_boxplot_figure(df: pd.DataFrame, metric: str, title: str | None):
     colors = [color_for_group(i) for i in range(len(groups))]
     # n прямо в подписи оси — жалоба была не на отсутствие данных (они и так шли в
     # compare_groups), а на то, что размер выборки не виден на самом графике
-    tick_labels = [f"{g}\n(n={len(d)})" for g, d in zip(groups, data)]
+    # длинные имена групп переносятся — иначе подписи соседних групп наезжают друг на друга
+    tick_labels = [f"{textwrap.fill(str(g), 16)}\n(n={len(d)})" for g, d in zip(groups, data)]
 
     fig, ax = plt.subplots(figsize=(max(4, 1.2 * len(groups) + 2), 5))
     ax.set_facecolor("#fcfcfb")

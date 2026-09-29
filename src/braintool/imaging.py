@@ -14,8 +14,11 @@ from .models import GroupConfig, Shot
 
 IMAGE_EXTENSIONS = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
 
-# ищет "exp" + число в имени файла, например ex730em810exp150angle112.tif -> exposure=150
-_EXPOSURE_RE = re.compile(r"exp(\d+)", re.IGNORECASE)
+# ищет "exp" + число в имени файла, например ex730em810exp150angle112.tif -> exposure=150.
+# В части папок лаборатории «p» пропущено: ex730em810ex10angle112.tif — «ex» сразу после
+# цифры (не в начале, где ex730 — длина волны) тоже выдержка (сессия 11: 73 таких файла
+# на данных с Яндекс.Диска, раньше каждый был отдельным «кадром» без выдержки)
+_EXPOSURE_RE = re.compile(r"exp(\d+)|(?<=\d)ex(\d+)", re.IGNORECASE)
 
 # снимок при внешнем свете: «Reference (Filt695 exp2000).tif», «Ref4000.tif», «ref 1_2exp.tif»
 # (так их называют в лаборатории, 147 папок из 345 на Яндекс.Диске). Это не
@@ -127,7 +130,7 @@ def scan_group_folder(group: GroupConfig) -> list[Shot]:
             continue
         match = _EXPOSURE_RE.search(path.stem)
         if match:
-            exposure = int(match.group(1))
+            exposure = int(match.group(1) or match.group(2))
             key = path.stem[: match.start()] + path.stem[match.end():]
         else:
             exposure = 0
