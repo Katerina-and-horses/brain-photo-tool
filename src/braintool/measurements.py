@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .models import MeasurementRow, ShotReview
+from .models import MaskMode, MeasurementRow, ShotReview, nose_side
 
 
 def measure_shot(
@@ -45,6 +45,7 @@ def measure_shot(
                 exposure_ms=exposure_ms,
                 is_control=review.shot.group.is_control,
                 condition=review.shot.group.condition,
+                side=nose_side(review.masks, m) if review.shot.group.mode == MaskMode.ROSTRAL_CUT else "",
             )
         )
     return rows
@@ -60,6 +61,9 @@ def rows_to_dataframe(rows: list[MeasurementRow]) -> pd.DataFrame:
     if not df.empty:
         df["animal_index"] = df["animal_index"] + 1
         df["slice_index"] = df["slice_index"] + 1
+        # сторона носа нужна только в пайплайне носа — у срезов колонка пустая, убираем
+        if not (df["side"] != "").any():
+            df = df.drop(columns=["side"])
     if df.empty:
         df = pd.DataFrame(
             columns=[

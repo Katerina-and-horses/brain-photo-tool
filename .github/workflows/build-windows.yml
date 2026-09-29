@@ -58,4 +58,12 @@ jobs:
           $tag = "build-${{ github.run_number }}"
           $sha = "${{ github.sha }}".Substring(0, 7)
           $notes = "Автосборка из коммита $sha. Скачайте BrainPhotoTool-windows.zip, распакуйте и дважды кликните «Запуск программы»."
-          gh release create $tag BrainPhotoTool-windows.zip --target "${{ github.sha }}" --title "BrainPhotoTool ($(Get-Date -Format 'dd.MM.yyyy'), сборка ${{ github.run_number }})" --notes $notes --latest
+          $title = "BrainPhotoTool ($(Get-Date -Format 'dd.MM.yyyy'), сборка ${{ github.run_number }})"
+          if ("${{ github.ref_name }}" -eq "master") {
+            gh release create $tag BrainPhotoTool-windows.zip --target "${{ github.sha }}" --title $title --notes $notes --latest
+          } else {
+            # ручной запуск из ветки — тестовая сборка до слияния: не «последняя»,
+            # чтобы лаборатория не скачала непроверенную версию
+            $notes = "ТЕСТОВАЯ сборка из ветки ${{ github.ref_name }} (не для работы, до проверки). " + $notes
+            gh release create $tag BrainPhotoTool-windows.zip --target "${{ github.sha }}" --title "ТЕСТ: $title" --notes $notes --prerelease --latest=false
+          }

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from .models import GroupConfig, MaskMode, SpecimenMask
+from .models import NOSE_SIDES, GroupConfig, MaskMode, SpecimenMask
 
 # минимальная площадь пятна в пикселях, чтобы не путать шум/пыль/битые пиксели с животным
 # (реальные срезы/черепа в образцах — от нескольких сотен пикселей, шумовые точки — до ~150)
@@ -140,29 +140,6 @@ def grow_blob_to_soft_edge(
     grown = (dilated & grow_binary) | blob.mask
     ys, xs = np.nonzero(grown)
     return Blob(mask=grown, centroid=(float(xs.mean()), float(ys.mean())), area=int(grown.sum()))
-
-
-def _split_into_columns(blobs: list[Blob], cols: int) -> list[list[Blob]]:
-    """Делит пятна на `cols` групп по X-координате, используя самые большие разрывы."""
-    if not blobs:
-        return []
-    ordered = sorted(blobs, key=lambda b: b.centroid[0])
-    if cols <= 1 or len(ordered) <= cols:
-        # либо одна колонка, либо пятен меньше/столько же, сколько ожидалось колонок —
-        # каждое пятно получает свою колонку (сигнал, что что-то не совпало с ожиданием)
-        return [[b] for b in ordered] if len(ordered) <= cols and cols > 1 else [ordered]
-
-    gaps = [(ordered[i + 1].centroid[0] - ordered[i].centroid[0], i) for i in range(len(ordered) - 1)]
-    gaps.sort(key=lambda g: g[0], reverse=True)
-    split_after = sorted(i for _, i in gaps[: cols - 1])
-
-    columns: list[list[Blob]] = []
-    start = 0
-    for idx in split_after:
-        columns.append(ordered[start: idx + 1])
-        start = idx + 1
-    columns.append(ordered[start:])
-    return columns
 
 
 # --- раскладка срезов по животным (режим WHOLE_BLOB, сессия 7) ---
@@ -299,46 +276,175 @@ def assign_blobs_to_grid(
     return assignment, max(max_rows, 1), ("\n".join(notes) if notes else None)
 
 
-def _split_by_largest_y_gap(blobs: list[Blob]) -> tuple[list[Blob], list[Blob]]:
-    """Делит пятна на верхнюю и нижнюю полосу по самому большому разрыву по Y.
+# --- черепа на фото «череп и мозг» (сессия 10) ---
+# Прежняя раскладка делила пятна на ряды по самому большому разрыву между ЦЕНТРАМИ по
+# Y: черепа одного ряда стоят на разной высоте (разница центров 30–50 px), и на
+# тёмных кадрах без мозгов этот разрыв резал сам ряд черепов — часть черепов терялась
+# (данные с Яндекс.Диска, сессия 10). Мусор (засвеченная полоса у края кадра, край
+# планшета, ободки лунок, яркие точки) шёл в колонки наравне с черепами и отнимал
+# колонку у настоящего черепа.
 
-    Используется, чтобы отделить ряд черепов (сверху) от ряда целых мозгов (снизу) на
-    фото «череп и мозг» по фактическому расположению на КОНКРЕТНОМ фото, а не считать,
-    что достаточно взять "самое верхнее пятно в каждой колонке" — если у одного черепа
-    носовая часть слишком тусклая и не находится вообще, "самым верхним" в этой колонке
-    ошибочно окажется мозг снизу.
+# пятно-мусор: вытянуто сильнее этого (полоса у края кадра — 16:1, край планшета — 25:1;
+# череп — до 2,1:1, мозг — до 1,5:1)
+JUNK_MAX_ASPECT = 5.0
+# пятно-мусор: занимает меньше этой доли выпуклой оболочки (ободки лунок планшета —
+# 0,3–0,5; черепа — 0,73–0,98, мозги — 0,85–0,99)
+JUNK_MIN_SOLIDITY = 0.6
+# пятно-мусор: площадь меньше этой доли типичного крупного пятна на кадре (точки на
+# планшете — 1–11% черепа; мозг — ~35% черепа)
+JUNK_MIN_AREA_FRACTION = 0.15
+# пятна в одном ряду, если их диапазоны по Y перекрываются больше чем на эту долю
+# высоты меньшего
+SAME_ROW_Y_OVERLAP = 0.3
+# ряд черепов — верхний ряд, чья суммарная площадь не меньше этой доли самого
+# «тяжёлого» ряда: одинокий кусочек ткани выше черепов образует свой ряд и иначе
+# принимался за ряд черепов (все черепа терялись)
+MIN_ROW_AREA_FRACTION = 0.3
+# кусков в ряду больше, чем животных в настройках, — ближайшие соседи склеиваются,
+# если промежуток между ними меньше этой доли ширины куска (раскрытые черепа: обе
+# половинки лежат отдельными пятнами, раскрытые буквой V)
+PAIR_MAX_GAP_FRACTION = 0.5
+# черепов меньше, чем животных, — самое широкое пятно режется надвое, если оно хотя бы
+# во столько раз шире остальных (соседние черепа, соприкоснувшиеся широко — открытие
+# их не разделяет). Разрез — по самому узкому столбцу в средней части пятна
+SPLIT_MIN_WIDTH_RATIO = 1.5
+SPLIT_SEARCH = (0.3, 0.7)
+# куски одного черепа (череп, разделённый тёмной перегородкой на два пятна): кусок уже
+# этой доли типичной ширины черепа в ряду, промежуток до соседа меньше SAME_SKULL_X_GAP
+# типичной ширины, а вместе они не шире SAME_SKULL_MAX_WIDTH типичной. Соседние черепа
+# лежат вплотную (промежуток 5–15% ширины), поэтому одной близости мало
+SAME_SKULL_PART_WIDTH = 0.7
+SAME_SKULL_X_GAP = 0.15
+SAME_SKULL_MAX_WIDTH = 1.3
+# открытие пятна черепа кругом такой доли его ширины: убирает отростки (проволочка,
+# ворсинка, лоскуты ткани по бокам толщиной 15–25 px при ширине черепа ~160 px),
+# которые давали маске носа «флажки» и сбивали поиск «талии». Потом край пятна
+# возвращается в пределах половины радиуса — острый кончик носа не срезается
+SKULL_OPEN_FRACTION = 0.16
 
-    Порог "заметности" самого большого разрыва сравнивается с типичным разрывом ВНУТРИ
-    ряда (между соседними черепами или соседними мозгами) — он на реальных фото на
-    порядок меньше разрыва МЕЖДУ рядами и не зависит от формы/вытянутости конкретного
-    пятна (в отличие от высоты пятна — на практике черепа часто вытянуты почти на всю
-    высоту своего ряда, вплотную к границе с рядом мозгов, так что сравнение с высотой
-    пятна ненадёжно). При подсчёте типичного разрыва сам оцениваемый (самый большой)
-    разрыв исключается — иначе при малом числе пятен медиана вырождается в сам этот
-    разрыв, и он почти никогда не признаётся "достаточно большим".
 
-    Если пятен всего два (напр. один череп + один его мозг — весь кадр с одним
-    животным, `cols=1`) — сравнивать не с чем, и здесь мы просто делим по этому
-    единственному разрыву: на фото «череп и мозг» два пятна почти всегда и есть ровно
-    эта пара. Вызывающий код (`assign_rostral_blobs_to_grid`) в этом случае явно
-    предупреждает пользователя о низкой уверенности.
+def _blob_shape(blob: Blob) -> tuple[float, float]:
+    """(вытянутость минимального прямоугольника, заполненность выпуклой оболочки)."""
+    cs, _ = cv2.findContours(blob.mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    c = max(cs, key=cv2.contourArea)
+    (_, _), (rw, rh), _ = cv2.minAreaRect(c)
+    aspect = max(rw, rh) / max(min(rw, rh), 1.0)
+    hull = cv2.contourArea(cv2.convexHull(c))
+    return aspect, blob.area / max(hull, 1.0)
 
-    Если пятно всего одно — делить нечего, но и уверенности в том, что это череп,
-    а не мозг, тоже нет (см. предупреждение там же).
-    """
-    if len(blobs) < 2:
-        return list(blobs), []
-    ordered = sorted(blobs, key=lambda b: b.centroid[1])
-    gaps = [(ordered[i + 1].centroid[1] - ordered[i].centroid[1], i) for i in range(len(ordered) - 1)]
-    gap, idx = max(gaps, key=lambda g: g[0])
 
-    other_gaps = [g for g, i in gaps if i != idx]
-    if other_gaps:
-        threshold = max(float(np.median(other_gaps)) * 2.0, 30.0)
-        if gap < threshold:
-            return ordered, []
+def drop_junk_blobs(blobs: list[Blob]) -> tuple[list[Blob], int]:
+    """Отбрасывает пятна, которые не могут быть ни черепом, ни мозгом: тонкие полосы,
+    дырявые (ободки лунок), мелкие точки. Возвращает (оставшиеся, сколько отброшено)."""
+    shapes = [_blob_shape(b) for b in blobs]
+    shaped = [
+        b for b, (aspect, solidity) in zip(blobs, shapes)
+        if aspect <= JUNK_MAX_ASPECT and solidity >= JUNK_MIN_SOLIDITY
+    ]
+    if not shaped:
+        return [], len(blobs)
+    areas = np.array([b.area for b in shaped], dtype=np.float64)
+    typical = float(np.median(areas[areas >= 0.25 * areas.max()]))
+    kept = [b for b in shaped if b.area >= JUNK_MIN_AREA_FRACTION * typical]
+    return kept, len(blobs) - len(kept)
 
-    return ordered[: idx + 1], ordered[idx + 1 :]
+
+def _group_rows(blobs: list[Blob]) -> list[list[Blob]]:
+    """Ряды пятен сверху вниз: пятна в одном ряду, если перекрываются по высоте."""
+    rows: list[list[Blob]] = []
+    for blob in sorted(blobs, key=lambda b: _blob_y_range(b)[0]):
+        y0, y1 = _blob_y_range(blob)
+        for row in rows:
+            if any(
+                min(y1, r1) - max(y0, r0) > SAME_ROW_Y_OVERLAP * max(1, min(y1 - y0, r1 - r0))
+                for r0, r1 in (_blob_y_range(b) for b in row)
+            ):
+                row.append(blob)
+                break
+        else:
+            rows.append([blob])
+    return sorted(rows, key=lambda r: min(_blob_y_range(b)[0] for b in r))
+
+
+def _blob_x_range(blob: Blob) -> tuple[int, int]:
+    xs = np.flatnonzero(blob.mask.any(axis=0))
+    return (int(xs[0]), int(xs[-1]) + 1) if xs.size else (0, 0)
+
+
+def _merge_skull_parts(row: list[Blob]) -> list[Blob]:
+    """Склеивает куски одного черепа (см. SAME_SKULL_*); результат — слева направо."""
+    typical = float(np.median([_blob_x_width(b) for b in row])) if row else 0.0
+    groups: list[list[Blob]] = []
+    for blob in sorted(row, key=lambda b: _blob_x_range(b)[0]):
+        x0, x1 = _blob_x_range(blob)
+        if groups:
+            gx0 = min(_blob_x_range(b)[0] for b in groups[-1])
+            gx1 = max(_blob_x_range(b)[1] for b in groups[-1])
+            narrow = min(x1 - x0, gx1 - gx0) < SAME_SKULL_PART_WIDTH * typical
+            close = x0 - gx1 < SAME_SKULL_X_GAP * typical
+            fits = max(x1, gx1) - min(x0, gx0) <= SAME_SKULL_MAX_WIDTH * typical
+            if narrow and close and fits:
+                groups[-1].append(blob)
+                continue
+        groups.append([blob])
+    return [g[0] if len(g) == 1 else _merge_blobs(g) for g in groups]
+
+
+# разрыв тонких перемычек между пятнами до раскладки: открытие кругом такого диаметра
+# (доля ширины кадра; на кадре 1368 px — 11 px, череп ~150 px). Соседние черепа,
+# соединённые ушками/ворсинками, и черепа, слипшиеся со светящимися ободками лунок,
+# иначе становились одним пятном
+BRIDGE_OPEN_FRACTION = 0.008
+
+
+def split_thin_bridges(blobs: list[Blob], shape: tuple[int, int]) -> list[Blob]:
+    """Разрывает тонкие перемычки между пятнами и заново делит на связные куски."""
+    if not blobs:
+        return []
+    d = max(5, int(round(BRIDGE_OPEN_FRACTION * shape[1])) | 1)
+    union = np.zeros(shape, dtype=np.uint8)
+    for b in blobs:
+        union |= b.mask.astype(np.uint8)
+    opened = cv2.morphologyEx(union, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d)))
+    n, labels, stats, centroids = cv2.connectedComponentsWithStats(opened, connectivity=8)
+    return [
+        Blob(mask=labels == k, centroid=(float(centroids[k][0]), float(centroids[k][1])),
+             area=int(stats[k, cv2.CC_STAT_AREA]))
+        for k in range(1, n) if stats[k, cv2.CC_STAT_AREA] >= MIN_BLOB_AREA_PX
+    ]
+
+
+def _split_wide_blob(blob: Blob) -> list[Blob]:
+    """Режет пятно из двух соприкоснувшихся черепов по самому узкому столбцу."""
+    x0, x1 = _blob_x_range(blob)
+    cols = blob.mask[:, x0:x1].sum(axis=0)
+    lo, hi = int(SPLIT_SEARCH[0] * len(cols)), int(SPLIT_SEARCH[1] * len(cols))
+    cut = x0 + lo + int(np.argmin(cols[lo:hi]))
+    parts = [blob.mask.copy(), blob.mask.copy()]
+    parts[0][:, cut:] = False
+    parts[1][:, :cut] = False
+    out = []
+    for m in parts:
+        ys, xs = np.nonzero(m)
+        if len(xs):
+            out.append(Blob(mask=m, centroid=(float(xs.mean()), float(ys.mean())), area=int(len(xs))))
+    return out
+
+
+def smooth_skull_blob(blob: Blob) -> Blob:
+    """Убирает отростки пятна черепа (см. SKULL_OPEN_FRACTION), оставляя крупные связные
+    куски (`KEEP_PART_FRACTION`)."""
+    width = _blob_x_width(blob)
+    r = max(2, int(round(SKULL_OPEN_FRACTION * width / 2)))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+    opened = cv2.morphologyEx(blob.mask.astype(np.uint8), cv2.MORPH_OPEN, kernel) > 0
+    if not opened.any():
+        return blob
+    core = _large_components(opened).astype(np.uint8)
+    back = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r + 1, r + 1))
+    mask = _large_components(blob.mask & (cv2.dilate(core, back) > 0))
+    ys, xs = np.nonzero(mask)
+    return Blob(mask=mask, centroid=(float(xs.mean()), float(ys.mean())), area=int(mask.sum()))
 
 
 def assign_rostral_blobs_to_grid(
@@ -346,43 +452,63 @@ def assign_rostral_blobs_to_grid(
 ) -> tuple[dict[tuple[int, int], Blob], str | None]:
     """Раскладка пятен по животным для режима «носовая часть черепа».
 
-    На фото «череп и мозг» под каждым черепом лежит ещё и целый мозг — в этом режиме
-    он не анализируется вообще, это отдельный этап (срезы). Сначала все пятна на фото
-    делятся на верхнюю полосу (черепа) и нижнюю (мозги) по самому большому разрыву по Y
-    (см. `_split_by_largest_y_gap`) — это надёжнее, чем "самое верхнее пятно в колонке":
-    если у одного черепа носовая часть не нашлась вообще, колонка просто останется
-    пустой (доразметить вручную), а не подхватит мозг снизу как замену черепу.
+    На фото «череп и мозг» черепа лежат верхним рядом носом вверх, под ними — мозги
+    (в этом режиме не анализируются). Мусор отбрасывается по форме и размеру
+    (`drop_junk_blobs`), ряды — по перекрытию пятен по высоте (`_group_rows`), черепа —
+    верхний ряд; куски одного черепа склеиваются. Если черепов больше, чем животных в
+    настройках, берутся самые крупные; если меньше — недостающие животные остаются
+    пустыми (доразметить вручную), с предупреждением.
     """
-    top_band, bottom_band = _split_by_largest_y_gap(blobs)
-    columns = _split_into_columns(top_band, cols)
+    split = split_thin_bridges(blobs, blobs[0].mask.shape) if blobs else []
+    kept, dropped = drop_junk_blobs(split)
+    rows = _group_rows(kept)
+    if rows:
+        heaviest = max(sum(b.area for b in r) for r in rows)
+        rows = [r for r in rows if sum(b.area for b in r) >= MIN_ROW_AREA_FRACTION * heaviest]
+    skulls = _merge_skull_parts(rows[0]) if rows else []
+    while len(skulls) > cols:
+        typical = float(np.median([_blob_x_width(b) for b in skulls]))
+        gaps = [
+            (_blob_x_range(skulls[k + 1])[0] - _blob_x_range(skulls[k])[1], k)
+            for k in range(len(skulls) - 1)
+        ]
+        gap, k = min(gaps)
+        if gap >= PAIR_MAX_GAP_FRACTION * typical:
+            break
+        skulls[k: k + 2] = [_merge_blobs(skulls[k: k + 2])]
+    while 1 < len(skulls) < cols:
+        widths = [_blob_x_width(b) for b in skulls]
+        k = int(np.argmax(widths))
+        others = float(np.median([w for j, w in enumerate(widths) if j != k]))
+        parts = _split_wide_blob(skulls[k]) if widths[k] >= SPLIT_MIN_WIDTH_RATIO * others else []
+        if len(parts) < 2:
+            break
+        skulls[k: k + 1] = parts
 
-    warning: str | None = None
-    missing = [i + 1 for i, c in enumerate(columns) if not c]
-    if len(columns) < cols or missing:
-        counts = [len(c) for c in columns]
-        warning = (
-            f"Не для всех животных нашёлся череп на фото (ожидалось {cols}, "
-            f"пятен в колонках: {counts}). Недостающие ячейки нужно доразметить вручную."
+    notes: list[str] = []
+    if dropped:
+        notes.append(
+            f"Отброшено как посторонние объекты (засвет у края, край планшета, точки): {dropped} шт."
         )
-    elif not bottom_band:
-        # разрыв между рядом черепов и рядом мозгов не нашёлся (мало пятен на фото —
-        # например, один череп вообще не даёт сигнала, и сравнивать не с чем) — не можем
-        # быть уверены, что каждое найденное пятно действительно череп, а не мозг
-        warning = (
-            "Не удалось надёжно отличить ряд черепов от ряда мозгов на этом фото "
-            "(слишком мало найденных пятен, чтобы сравнить их расположение). "
-            "Автоматическая обводка ниже может ошибочно относиться к мозгу вместо "
-            "черепа — обязательно проверьте эту разметку вручную."
+    if len(skulls) > cols:
+        biggest = sorted(skulls, key=lambda b: b.area, reverse=True)[:cols]
+        skulls = [s for s in skulls if any(s is b for b in biggest)]
+        notes.append(
+            f"Черепов на фото больше, чем животных в настройках группы ({cols}) — взяты "
+            "самые крупные, проверьте."
+        )
+    elif len(skulls) < cols:
+        notes.append(
+            f"Найдено черепов: {len(skulls)}, ожидалось {cols}. Недостающих животных "
+            "нужно доразметить вручную (кисть или «Поищи здесь»)."
+        )
+    if len(rows) == 1 and skulls:
+        notes.append(
+            "Не видно ряда мозгов под черепами — проверьте, что обведены именно черепа."
         )
 
-    assignment: dict[tuple[int, int], Blob] = {}
-    for animal_index, column_blobs in enumerate(columns):
-        if animal_index >= cols or not column_blobs:
-            continue
-        topmost = min(column_blobs, key=lambda b: b.centroid[1])
-        assignment[(animal_index, 0)] = topmost
-
-    return assignment, warning
+    assignment = {(i, 0): smooth_skull_blob(s) for i, s in enumerate(skulls)}
+    return assignment, ("\n".join(notes) if notes else None)
 
 
 def _find_rostral_boundary_bin(profile: np.ndarray) -> int:
@@ -524,8 +650,219 @@ def compute_rostral_cut(
     return rostral_mask, (p1, p2), is_elongated
 
 
+# ---------- Нос: левая и правая половина (сессия 9) ----------
+# Половины строятся симметрично ПО ПОСТРОЕНИЮ: ось — ось зеркальной симметрии формы
+# передней части черепа (не по яркости — яркость и есть измеряемый сигнал), бока —
+# край ткани своей стороны, низ — по яркости, но общий для обеих сторон (профиль
+# левой стороны и зеркально отражённой правой усредняются). Прежние варианты (путь по
+# тёмной борозде, низ по яркости каждой стороны отдельно) на фото лаборатории давали
+# половины разного размера и теряли край (скрины 569–571).
+
+# наклон оси (px по x на px по y) и сдвиг от центра (доля ширины), в которых ищется ось
+AXIS_MAX_SLOPE = 0.35
+AXIS_MAX_SHIFT_FRACTION = 0.2
+# половина ширины разреза между половинами, px (перегородка/клин вырезаются отдельно —
+# нижним краем по яркости)
+MIDLINE_GAP_PX = 1
+# доля нижних пикселей строки, в которых ищется ось: берём нос и чуть ниже «талии»
+AXIS_FIT_BELOW_CUT_FRACTION = 0.3
+
+
+def _smooth_rows(values: np.ndarray, window: int) -> np.ndarray:
+    """Медиана (убирает одиночные выбросы) + скользящее среднее."""
+    if len(values) < 3:
+        return values.astype(np.float64)
+    h = min(window // 2, (len(values) - 1) // 2)
+    padded = np.pad(values.astype(np.float64), h, mode="edge")
+    med = np.array([np.median(padded[i : i + 2 * h + 1]) for i in range(len(values))])
+    padded = np.pad(med, h, mode="edge")
+    return np.convolve(padded, np.ones(2 * h + 1) / (2 * h + 1), mode="valid")
+
+
+def symmetry_axis(region: np.ndarray) -> tuple[float, float]:
+    """Ось зеркальной симметрии области (нос черепа): x = a + b·y.
+
+    Перебор наклона и сдвига; для каждой оси по строкам сравнивается отрезок ткани
+    [l, r] с его отражением [2c−r, 2c−l] (c — точка оси в этой строке), оценка —
+    суммарное пересечение / объединение. Нос лежит носом вверх, поэтому ось почти
+    вертикальна (|b| ≤ AXIS_MAX_SLOPE)."""
+    rows = np.nonzero(region.any(axis=1))[0]
+    ls = np.array([np.argmax(region[y]) for y in rows], dtype=np.float64)
+    rs = np.array([region.shape[1] - 1 - np.argmax(region[y][::-1]) for y in rows], dtype=np.float64)
+    mids = (ls + rs) / 2
+    width = float(np.median(rs - ls)) + 1
+    y0 = float(np.median(rows))
+    base = float(np.median(mids))
+    best, best_score = (base, 0.0), -1.0
+    for b in np.linspace(-AXIS_MAX_SLOPE, AXIS_MAX_SLOPE, 29):
+        for da in np.linspace(-AXIS_MAX_SHIFT_FRACTION, AXIS_MAX_SHIFT_FRACTION, 33) * width:
+            c = base + da + b * (rows - y0)
+            ml, mr = 2 * c - rs, 2 * c - ls
+            inter = np.clip(np.minimum(rs, mr) - np.maximum(ls, ml) + 1, 0, None).sum()
+            union = (rs - ls + 1).sum() + (mr - ml + 1).sum() - inter
+            score = inter / max(union, 1)
+            if score > best_score:
+                best_score, best = score, (base + da - b * y0, b)
+    return best
+
+
+NOSE_LEVEL = 0.5
+# если нос ярче остального черепа меньше чем во столько раз (оба — за вычетом фона
+# камеры) — низ по яркости ненадёжен, низ — прямая по «талии»
+NOSE_MIN_CONTRAST = 1.3
+# насколько ниже «талии» может уходить яркий нос (доля длины носа)
+NOSE_EXTEND_FRACTION = 0.5
+# сглаживание нижнего края по расстоянию от оси (px)
+NOSE_BOTTOM_SMOOTH_PX = 7
+# узкие выступы нижнего края вниз уже этой доли ширины половины срезаются; узкие
+# вырезы вверх (тёмный клин у оси) остаются
+NOSE_SPIKE_FRACTION = 0.35
+
+
+def _cut_narrow_spikes(values: np.ndarray, window: int) -> np.ndarray:
+    """Морфологическое открытие профиля (минимум, затем максимум в окне): убирает
+    узкие пики (выступы вниз), не трогая узкие провалы (вырезы вверх)."""
+    h = max(1, window // 2)
+    if len(values) <= 2 * h:
+        return values
+    pad = np.pad(values, h, mode="edge")
+    lo = np.lib.stride_tricks.sliding_window_view(pad, 2 * h + 1).min(axis=1)
+    pad = np.pad(lo, h, mode="edge")
+    return np.lib.stride_tricks.sliding_window_view(pad, 2 * h + 1).max(axis=1)
+
+
+def _shift_line(line, shift_vec) -> tuple[tuple[float, float], tuple[float, float]]:
+    (x1, y1), (x2, y2) = line
+    return ((x1 + shift_vec[0], y1 + shift_vec[1]), (x2 + shift_vec[0], y2 + shift_vec[1]))
+
+
+def _nose_level(arr, rostral, caudal, background) -> float | None:
+    if rostral.sum() < 50 or caudal.sum() < 50:
+        return None
+    nose_med = float(np.median(arr[rostral]))
+    rest_med = float(np.median(arr[caudal]))
+    if nose_med - background < NOSE_MIN_CONTRAST * max(rest_med - background, 1e-6):
+        return None
+    return rest_med + NOSE_LEVEL * (nose_med - rest_med)
+
+
+def _bottom_profile(bright: np.ndarray, dist: np.ndarray, side_mask: np.ndarray, n: int) -> np.ndarray:
+    """Нижний край яркого по расстоянию от оси (0..n−1): самая нижняя строка."""
+    prof = np.full(n, np.nan)
+    ys, xs = np.nonzero(bright & side_mask)
+    if len(ys) == 0:
+        return prof
+    d = np.clip(dist[ys, xs].astype(int), 0, n - 1)
+    np.fmax.at(prof, d, ys.astype(np.float64))
+    return prof
+
+
+def nose_halves(
+    image: np.ndarray,
+    blob_mask: np.ndarray,
+    cut_line: tuple[tuple[float, float], tuple[float, float]],
+    anchor: tuple[float, float],
+    background: float,
+) -> list[np.ndarray]:
+    """Левая и правая половина носа черепа (см. комментарий к блоку выше)."""
+    h, w = blob_mask.shape
+    rostral = recompute_rostral_mask_from_line(blob_mask, cut_line, anchor)
+    p1, p2 = np.array(cut_line[0]), np.array(cut_line[1])
+    normal = np.array([-(p2 - p1)[1], (p2 - p1)[0]])
+    normal /= max(np.linalg.norm(normal), 1e-9)
+    if np.dot(np.array(anchor) - p1, normal) > 0:
+        normal = -normal   # смотрит от носа (вниз по черепу)
+    ys, xs = np.nonzero(rostral)
+    nose_len = float(np.max(-((np.column_stack([xs, ys]) - p1) @ normal))) if len(ys) else 1.0
+    # ось — по носу и чуть ниже «талии» (одна узкая «пипка» кончика её не качает)
+    fit_region = recompute_rostral_mask_from_line(
+        blob_mask, _shift_line(cut_line, normal * nose_len * AXIS_FIT_BELOW_CUT_FRACTION), anchor)
+    a, b = symmetry_axis(fit_region if fit_region.any() else blob_mask)
+    yy, xx = np.mgrid[0:h, 0:w]
+    signed = (xx - (a + b * yy)) / np.sqrt(1 + b * b)
+    dist = np.abs(signed)
+    left_side = signed < -MIDLINE_GAP_PX
+    right_side = signed > MIDLINE_GAP_PX
+
+    arr = cv2.GaussianBlur(image.astype(np.float32), (0, 0), 2.0)
+    caudal = blob_mask & ~rostral
+    common = _nose_level(arr, rostral, caudal, background)
+    if common is None:
+        # нос не ярче черепа — низ по «талии», перпендикулярно оси
+        return [_largest_component(rostral & s) for s in (left_side, right_side)]
+
+    limit_line = _shift_line(cut_line, normal * nose_len * NOSE_EXTEND_FRACTION)
+    allowed = recompute_rostral_mask_from_line(blob_mask, limit_line, anchor)
+    ell = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    n = int(dist[blob_mask].max()) + 2 if blob_mask.any() else 2
+    profiles = []
+    for side in (left_side, right_side):
+        # порог своей стороны — более яркая сторона не получает нос глубже
+        level = _nose_level(arr, rostral & side, caudal & side, background) or common
+        bright = cv2.morphologyEx((allowed & side & (arr >= level)).astype(np.uint8), cv2.MORPH_OPEN, ell) > 0
+        nlab, labels = cv2.connectedComponents(bright.astype(np.uint8), connectivity=8)
+        keep = np.zeros_like(bright)
+        side_rostral = rostral & side
+        for lab in range(1, nlab):
+            comp = labels == lab
+            if (comp & side_rostral).sum() >= 0.1 * max(side_rostral.sum(), 1):
+                keep |= comp
+        profiles.append(_bottom_profile(keep, dist, side, n))
+    # общий низ: среднее двух сторон там, где есть обе, иначе та, что есть
+    stack = np.vstack(profiles)
+    cnt = np.isfinite(stack).sum(axis=0)
+    prof = np.where(cnt > 0, np.nansum(stack, axis=0) / np.maximum(cnt, 1), np.nan)
+    if prof is None or not np.isfinite(prof).any():
+        return [_largest_component(rostral & s) for s in (left_side, right_side)]
+    # внешние расстояния без яркого (тусклый ободок) — продолжают соседние
+    widths = dist[blob_mask & allowed]
+    extent = int(np.percentile(widths, 99)) + 2 if len(widths) else n
+    prof = prof[:extent]
+    ok = np.isfinite(prof)
+    prof = np.interp(np.arange(len(prof)), np.nonzero(ok)[0], prof[ok])
+    prof = _cut_narrow_spikes(prof, max(9, int(len(prof) * NOSE_SPIKE_FRACTION)))
+    prof = np.minimum(prof, np.percentile(prof, 70) + 0.1 * nose_len)
+    prof = _smooth_rows(prof, NOSE_BOTTOM_SMOOTH_PX)
+    prof = np.r_[prof, np.full(n - len(prof), prof[-1])]
+    bottom = prof[np.clip(dist.astype(int), 0, n - 1)]
+    above = yy <= bottom
+    return [_largest_component(blob_mask & allowed & above & s) for s in (left_side, right_side)]
+
+
+def _background_level(image: np.ndarray, blobs: list[Blob]) -> float:
+    """Фон камеры: медиана кадра вдали от найденных пятен."""
+    arr = cv2.GaussianBlur(image.astype(np.float32), (0, 0), 2.0)
+    near = np.zeros(image.shape[:2], dtype=np.uint8)
+    for b in blobs:
+        near |= b.mask.astype(np.uint8)
+    far = cv2.dilate(near, np.ones((31, 31), np.uint8)) == 0
+    return float(np.median(arr[far])) if far.any() else float(np.median(arr))
+
+
+# кусок пятна черепа сохраняется при сглаживании, если он не меньше этой доли самого
+# большого: у раскрытого черепа две половинки — оба куска нужны
+KEEP_PART_FRACTION = 0.3
+
+
+def _large_components(mask: np.ndarray) -> np.ndarray:
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    if n <= 1:
+        return mask.astype(bool)
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    keep = 1 + np.flatnonzero(areas >= KEEP_PART_FRACTION * areas.max())
+    return np.isin(labels, keep)
+
+
+def _largest_component(mask: np.ndarray) -> np.ndarray:
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=4)
+    if n <= 1:
+        return mask.astype(bool)
+    best = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    return labels == best
+
+
 def build_masks_for_image(
-    image: np.ndarray, group: GroupConfig
+    image: np.ndarray, group: GroupConfig, reference: np.ndarray | None = None
 ) -> tuple[list[SpecimenMask], str | None]:
     """Главная функция: находит животных на фото и строит для них маски по режиму группы.
 
@@ -533,12 +870,21 @@ def build_masks_for_image(
     авто-детекция не нашла для неё пятно. В этом случае маска создаётся пустой,
     чтобы её можно было выбрать в интерфейсе и дорисовать кистью вручную, а не
     "потерять" ячейку молча.
+
+    `reference` — снимок той же камерой при внешнем свете, того же размера
+    (`imaging.load_reference`). В режиме носа форма черепов ищется на нём (во
+    флуоресценции череп часто едва виден — маски съёживались до ярких крапинок),
+    а нижний край носа по яркости — по-прежнему на самом кадре (сессия 10).
     """
-    blobs = detect_blobs(image)
+    use_reference = reference is not None and group.mode == MaskMode.ROSTRAL_CUT
+    blobs = detect_blobs(reference if use_reference else image)
     if group.mode == MaskMode.ROSTRAL_CUT:
         # фото «череп и мозг»: под каждым черепом на фото лежит ещё и целый мозг,
         # который в этом режиме не анализируется вообще — берём только черепа
         assignment, warning = assign_rostral_blobs_to_grid(blobs, group.cols)
+        if use_reference:
+            note = "Форма черепов найдена по снимку при внешнем свете (файл «Reference/Ref» в папке)."
+            warning = f"{note}\n{warning}" if warning else note
         resolved_rows = 1
     else:
         assignment, resolved_rows, warning = assign_blobs_to_grid(blobs, group.cols, group.rows)
@@ -557,32 +903,41 @@ def build_masks_for_image(
             masks.append(SpecimenMask(animal_index=animal_index, slice_index=slice_index, mask=grown.mask))
         return masks, warning
 
+    # ROSTRAL_CUT: у каждого животного две маски — левая (slice_index 0) и правая (1)
+    # половина носа, тёмная перегородка посередине не входит ни в одну (сессия 9)
     poorly_elongated_animals: list[int] = []
+    background = _background_level(image, blobs)
     for animal_index in range(group.cols):
-        for slice_index in range(resolved_rows):
-            blob = assignment.get((animal_index, slice_index))
-            if blob is None:
+        blob = assignment.get((animal_index, 0))
+        if blob is None:
+            for side in range(len(NOSE_SIDES)):
                 masks.append(
                     SpecimenMask(
                         animal_index=animal_index,
-                        slice_index=slice_index,
+                        slice_index=side,
                         mask=np.zeros(image.shape[:2], dtype=bool),
                     )
                 )
-            else:  # ROSTRAL_CUT
-                rostral_mask, cut_line, is_elongated = compute_rostral_cut(blob.mask)
-                if not is_elongated:
-                    poorly_elongated_animals.append(animal_index + 1)
-                masks.append(
-                    SpecimenMask(
-                        animal_index=animal_index,
-                        slice_index=slice_index,
-                        mask=rostral_mask,
-                        cut_line=cut_line,
-                        source_blob=blob.mask,
-                        rostral_anchor=_mask_centroid(rostral_mask),
-                    )
-                )
+            continue
+        # всё считается в рамке вокруг черепа: на весь кадр nose_halves строит несколько
+        # массивов float64, на фото 20 Мп это ~1 ГБ памяти (сессия 10)
+        ys, xs = np.nonzero(blob.mask)
+        pad = int(0.3 * max(ys.max() - ys.min(), xs.max() - xs.min())) + 20
+        y0, y1 = max(0, ys.min() - pad), min(image.shape[0], ys.max() + pad + 1)
+        x0, x1 = max(0, xs.min() - pad), min(image.shape[1], xs.max() + pad + 1)
+        crop_mask = blob.mask[y0:y1, x0:x1]
+        rostral_mask, cut_line, is_elongated = compute_rostral_cut(crop_mask)
+        if not is_elongated:
+            poorly_elongated_animals.append(animal_index + 1)
+        anchor = _mask_centroid(rostral_mask)
+        # нос: нижний край по яркости (если нос заметно ярче черепа), иначе прямой
+        # отрез по «талии». Линии отреза у масок носа нет — после деления на половины
+        # и границы по яркости она ничего не определяла, только мешала (сессия 9)
+        noses = nose_halves(image[y0:y1, x0:x1], crop_mask, cut_line, anchor, background)
+        for side, nose in enumerate(noses):
+            full = np.zeros(image.shape[:2], dtype=bool)
+            full[y0:y1, x0:x1] = nose
+            masks.append(SpecimenMask(animal_index=animal_index, slice_index=side, mask=full))
 
     if poorly_elongated_animals:
         note = (
@@ -630,49 +985,101 @@ def recompute_rostral_mask_from_line(
     return out
 
 
-# Максимум вершин полигона при авто-упрощении контура. Больше — таскать мышью
-# неудобно (частокол ручек), меньше — форма грубеет и теряет вогнутости (например,
-# "запятую" носовой полости уже не изобразить). Число подобрано на глаз как разумный
-# компромисс, не измерялось на реальных фото пользователя.
-POLYGON_MAX_POINTS = 40
+# Контур для правки точками (с сессии 9): между точками — плавная кривая, а не прямые
+# отрезки, поэтому закругления держатся на немногих точках. Точек берётся столько,
+# сколько нужно, чтобы кривая совпала с маской (POLYGON_FIT_IOU), но не больше
+# POLYGON_MAX_POINTS. Раньше было до 40 точек с прямыми рёбрами — на фото с пятью
+# носами по две половины выходило ~400 точек, «непонятно, какие тянуть».
+POLYGON_MAX_POINTS = 24
+POLYGON_MIN_POINTS = 6
+POLYGON_FIT_IOU = 0.95
+# сколько точек кривой рисуется/растеризуется на каждое ребро между вершинами
+CURVE_SAMPLES_PER_EDGE = 12
+
+
+def smooth_curve(
+    polygon: list[tuple[float, float]], samples: int = CURVE_SAMPLES_PER_EDGE
+) -> np.ndarray:
+    """Замкнутая плавная кривая через вершины полигона (центростремительный
+    Catmull-Rom: проходит точно через каждую вершину, без петель и выбросов на
+    острых углах). Возвращает массив (N·samples, 2); ребро i — строки
+    [i·samples, (i+1)·samples)."""
+    pts = np.asarray(polygon, dtype=np.float64)
+    n = len(pts)
+    if n < 3:
+        return pts
+    out = np.empty((n * samples, 2))
+    t = np.linspace(0.0, 1.0, samples, endpoint=False)[:, None]
+    for i in range(n):
+        p0, p1, p2, p3 = pts[(i - 1) % n], pts[i], pts[(i + 1) % n], pts[(i + 2) % n]
+        d01 = max(np.linalg.norm(p1 - p0) ** 0.5, 1e-6)
+        d12 = max(np.linalg.norm(p2 - p1) ** 0.5, 1e-6)
+        d23 = max(np.linalg.norm(p3 - p2) ** 0.5, 1e-6)
+        # касательные в p1 и p2 (формула Barry–Goldman, переписанная через Эрмита)
+        m1 = (p1 - p0) / d01 - (p2 - p0) / (d01 + d12) + (p2 - p1) / d12
+        m2 = (p2 - p1) / d12 - (p3 - p1) / (d12 + d23) + (p3 - p2) / d23
+        m1 *= d12
+        m2 *= d12
+        h00 = 2 * t**3 - 3 * t**2 + 1
+        h10 = t**3 - 2 * t**2 + t
+        h01 = -2 * t**3 + 3 * t**2
+        h11 = t**3 - t**2
+        out[i * samples : (i + 1) * samples] = h00 * p1 + h10 * m1 + h01 * p2 + h11 * m2
+    return out
 
 
 def mask_to_polygon(mask: np.ndarray, max_points: int = POLYGON_MAX_POINTS) -> list[tuple[float, float]] | None:
-    """Строит полигон-контур по растровой маске — отправная точка для правки точками:
-    человек подтягивает уже готовый контур, а не обводит форму с нуля.
+    """Строит контур из немногих точек по растровой маске — отправная точка для правки
+    точками: человек подтягивает уже готовый контур, а не обводит форму с нуля.
 
     Возвращает None, если в маске нет ни одного закрашенного пикселя (нечего
     обводить). Если у маски несколько несвязных областей — обводится самая большая
     по площади; остальные при правке точками сохраняются как есть (см.
     `apply_polygon_edit`), но точками не редактируются.
-    `approxPolyDP` упрощает контур со всё бОльшим эпсилон, пока число вершин не
-    уложится в `max_points`.
+    `approxPolyDP` упрощает контур с убывающим эпсилон — берётся первый (самый
+    экономный) набор точек, плавная кривая через который совпадает с маской не хуже
+    POLYGON_FIT_IOU; не больше `max_points`.
     """
-    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not contours:
         return None
     contour = max(contours, key=cv2.contourArea)
     if cv2.contourArea(contour) <= 0:
         return None
+    region = np.zeros(mask.shape, dtype=np.uint8)
+    cv2.drawContours(region, [contour], -1, 1, thickness=cv2.FILLED)
+    region = region.astype(bool)
 
     perimeter = cv2.arcLength(contour, True)
-    epsilon = max(perimeter * 0.002, 0.5)
-    approx = cv2.approxPolyDP(contour, epsilon, True)
-    while len(approx) > max_points:
-        epsilon *= 1.5
+    best = None
+    epsilon = perimeter / 8
+    while epsilon > 0.3:
         approx = cv2.approxPolyDP(contour, epsilon, True)
-        if epsilon > perimeter:  # защита от бесконечного цикла на вырожденном контуре
+        epsilon /= 1.25
+        if len(approx) < POLYGON_MIN_POINTS and epsilon > 0.3:
+            continue
+        if len(approx) > max_points:
             break
-    return [(float(p[0][0]), float(p[0][1])) for p in approx]
+        best = approx
+        poly = [(float(p[0][0]), float(p[0][1])) for p in approx]
+        fitted = polygon_to_mask(poly, mask.shape)
+        iou = (fitted & region).sum() / max((fitted | region).sum(), 1)
+        if iou >= POLYGON_FIT_IOU:
+            break
+    if best is None:   # крошечный контур — берём как есть
+        best = cv2.approxPolyDP(contour, 0.5, True)
+    return [(float(p[0][0]), float(p[0][1])) for p in best]
 
 
 def polygon_to_mask(polygon: list[tuple[float, float]], shape: tuple[int, int]) -> np.ndarray:
-    """Растеризует полигон (вершины по кругу, координаты изображения) в bool-маску
-    заданной формы `shape` (высота, ширина) — источник истины для площади/яркости
-    как и раньше остаётся растровая маска, полигон лишь способ её редактировать."""
+    """Растеризует контур (вершины по кругу, координаты изображения; между ними —
+    плавная кривая `smooth_curve`) в bool-маску формы `shape` (высота, ширина) —
+    источник истины для площади/яркости как и раньше остаётся растровая маска,
+    контур лишь способ её редактировать."""
     out = np.zeros(shape, dtype=np.uint8)
     if len(polygon) >= 3:
-        pts = np.array([[int(round(x)), int(round(y))] for x, y in polygon], dtype=np.int32)
+        curve = smooth_curve(polygon)
+        pts = np.round(curve).astype(np.int32)
         cv2.fillPoly(out, [pts], 1)
     return out.astype(bool)
 

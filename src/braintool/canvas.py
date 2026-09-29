@@ -10,8 +10,11 @@ from PySide6.QtGui import QBrush, QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QWidget
 
 from .colors import color_for_animal
-from .models import SpecimenMask
-from .segmentation import apply_polygon_edit, mask_to_polygon, recompute_rostral_mask_from_line
+from .models import MaskMode, SpecimenMask, part_label
+from .segmentation import (
+    CURVE_SAMPLES_PER_EDGE, apply_polygon_edit, mask_to_polygon, recompute_rostral_mask_from_line,
+    smooth_curve,
+)
 
 HANDLE_HIT_RADIUS_PX = 14  # в экранных пикселях — попадание по вершине (клик/тяга)
 EDGE_HIT_RADIUS_PX = 10    # попадание по ребру полигона (двойной клик — добавить точку)
@@ -39,6 +42,8 @@ class MaskCanvas(QWidget):
 
         self.image_u8: np.ndarray | None = None
         self.masks: list[SpecimenMask] = []
+        # пайплайн — только для подписи маски («срез 2» / «левая половина»)
+        self.mode: MaskMode | None = None
         # активна ОДНА конкретная маска (животное, срез) — не всё животное сразу,
         # иначе при нескольких срезах на животное правка всегда попадала бы в первый срез
         self.active_key: tuple[int, int] | None = None
@@ -227,6 +232,15 @@ class MaskCanvas(QWidget):
                 return m
         return None
 
+    def _cut_line_siblings(self, m: SpecimenMask) -> list[SpecimenMask]:
+        """Маски того же животного с той же линией отреза (левая и правая половина
+        носа) — линия у них общая и перетаскивается сразу у обеих."""
+        return [
+            o for o in self.masks
+            if o is m or (o.animal_index == m.animal_index and o.cut_line is not None
+                          and o.cut_line == m.cut_line)
+        ]
+
     # ---------- геометрия ----------
 
     def _recompute_draw_rect(self) -> None:
@@ -281,15 +295,16 @@ class MaskCanvas(QWidget):
                 if m.cut_line is not None:
                     self._draw_handles(painter, m, is_active=(m is active))
 
-        # полигон точек — по той же логике, что и линия отреза выше: ВСЕ маски сразу,
-        # активная ярче. Раньше показывалась только активная — оказалось неудобно
-        # переключаться между животными/срезами в списке слева, чтобы просто увидеть
-        # контур и понять, норм он или нет
+        # контур точек — у ВСЕХ масок сразу (чтобы видеть, норм ли он, не переключаясь
+        # по списку), но сами точки — только у выбранного животного (сессия 9: при
+        # точках у всех на фото их было ~400, «непонятно, какие тянуть»)
         if self._point_mode_enabled:
             self._ensure_all_polygons()
             for m in self.masks:
                 if m.polygon:
-                    self._draw_polygon(painter, m.polygon, is_active=(m is active))
+                    self._draw_polygon(
+                        painter, m.polygon, is_active=(m is active), show_handles=self._editable(m),
+                    )
 
         # активная маска раньше отличалась от остальных только чуть большей
         # непрозрачностью заливки (0.7 против 0.55) — на глаз почти незаметно, в какую
@@ -378,10 +393,11 @@ class MaskCanvas(QWidget):
         ys, xs = np.nonzero(m.mask)
         top = self._to_screen((float(xs.min()), float(ys.min())))
         text = f"Животное {m.animal_index + 1}"
-        # как в списке слева: номер среза — только если у животного их несколько
-        # (у черепов в пайплайне носа маска на животное одна)
-        if sum(1 for o in self.masks if o.animal_index == m.animal_index) > 1:
-            text += f", срез {m.slice_index + 1}"
+        # как в списке слева: номер среза — только если у животного их несколько,
+        # у носа — какая половина
+        part = part_label(self.mode, self.masks, m)
+        if part:
+            text += f", {part}"
         font = QFont(painter.font())
         font.setBold(True)
         painter.setFont(font)
@@ -455,19 +471,28 @@ class MaskCanvas(QWidget):
         painter.setPen(QPen(QColor(255, 255, 255, line_alpha), line_width, Qt.PenStyle.DashLine))
         painter.drawLine(QPointF(sx1, sy1), QPointF(sx2, sy2))
 
-    def _draw_polygon(self, painter: QPainter, polygon: list[tuple[float, float]], is_active: bool) -> None:
-        line_alpha = 230 if is_active else 110
+    def _draw_polygon(
+        self, painter: QPainter, polygon: list[tuple[float, float]], is_active: bool, show_handles: bool = True,
+    ) -> None:
+        line_alpha = 230 if is_active else (170 if show_handles else 90)
         line_width = 2 if is_active else 1
-        handle_radius = 5 if is_active else 3
+        handle_radius = 5 if is_active else 4
 
-        screen_pts = [self._to_screen(p) for p in polygon]
+        # между точками — та же плавная кривая, по которой растеризуется маска
+        curve = QPolygonF([self._to_screen((float(x), float(y))) for x, y in smooth_curve(polygon)])
         painter.setPen(QPen(QColor(255, 255, 255, line_alpha), line_width))
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        for i in range(len(screen_pts)):
-            painter.drawLine(screen_pts[i], screen_pts[(i + 1) % len(screen_pts)])
+        painter.drawPolygon(curve)
+        if not show_handles:
+            return
+        painter.setPen(QPen(QColor(0, 0, 0, 160), 1))
         painter.setBrush(QBrush(QColor(255, 255, 255, line_alpha)))
-        for sp in screen_pts:
-            painter.drawEllipse(sp, handle_radius, handle_radius)
+        for p in polygon:
+            painter.drawEllipse(self._to_screen(p), handle_radius, handle_radius)
+
+    def _editable(self, m: SpecimenMask) -> bool:
+        """Точки можно тянуть только у выбранного животного (у носа — обе половины)."""
+        return self.active_key is not None and m.animal_index == self.active_key[0]
 
     # ---------- взаимодействие мышью ----------
 
@@ -638,7 +663,9 @@ class MaskCanvas(QWidget):
             m, idx = self._dragging_handle
             other = m.cut_line[1 - idx]
             new_line = (img_pt, other) if idx == 0 else (other, img_pt)
-            m.cut_line = new_line
+            # у носа две половины с общей линией отреза — тянем её у обеих сразу
+            for o in self._cut_line_siblings(m):
+                o.cut_line = new_line
             self.update()
             return
         if self._dragging_brush:
@@ -665,8 +692,10 @@ class MaskCanvas(QWidget):
             self.maskEdited.emit()
             self.update()
         if self._dragging_handle is not None:
-            m, _ = self._dragging_handle
-            if m.source_blob is not None and m.cut_line is not None:
+            dragged, _ = self._dragging_handle
+            for m in self._cut_line_siblings(dragged):
+                if m.source_blob is None or m.cut_line is None:
+                    continue
                 p1, p2 = m.cut_line
                 degenerate = (p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2 < 1.0
                 if degenerate:
@@ -675,17 +704,16 @@ class MaskCanvas(QWidget):
                     # весь исходный blob целиком (весь череп). Оставляем маску как
                     # была — пользователь должен развести ручки снова, а не получить
                     # тихо неверный результат
-                    pass
-                else:
-                    # опорная точка фиксируется один раз при автоопределении (центроид
-                    # изначальной носовой части) и не пересчитывается — иначе при
-                    # перетаскивании линии сторона выбора могла неожиданно инвертироваться
-                    ref = m.rostral_anchor if m.rostral_anchor is not None else (0.0, 0.0)
-                    m.mask = recompute_rostral_mask_from_line(m.source_blob, m.cut_line, ref)
-                    # перетаскивание линии — тоже правка; раньше только кисть сбрасывала
-                    # "принято", и перетащенная-но-непроверенная маска могла остаться
-                    # помеченной как принятая
-                    m.accepted = False
+                    continue
+                # опорная точка фиксируется один раз при автоопределении (центроид
+                # изначальной носовой части) и не пересчитывается — иначе при
+                # перетаскивании линии сторона выбора могла неожиданно инвертироваться
+                ref = m.rostral_anchor if m.rostral_anchor is not None else (0.0, 0.0)
+                m.mask = recompute_rostral_mask_from_line(m.source_blob, m.cut_line, ref)
+                # перетаскивание линии — тоже правка; раньше только кисть сбрасывала
+                # "принято", и перетащенная-но-непроверенная маска могла остаться
+                # помеченной как принятая
+                m.accepted = False
             self._dragging_handle = None
             self.maskEdited.emit()
             self.update()
@@ -722,46 +750,47 @@ class MaskCanvas(QWidget):
         self.update()
 
     def _hit_test_polygon_vertex_any(self, img_pt: tuple[float, float]) -> tuple[SpecimenMask, int] | None:
+        # ближайшая точка выбранного животного (точки двух половин носа у перегородки
+        # стоят рядом — берём ближайшую, а не первую попавшуюся)
+        best, best_d = None, HANDLE_HIT_RADIUS_PX
         for m in self.masks:
-            if not m.polygon:
+            if not m.polygon or not self._editable(m):
                 continue
             for idx, p in enumerate(m.polygon):
-                dx = (p[0] - img_pt[0]) * self._scale
-                dy = (p[1] - img_pt[1]) * self._scale
-                if (dx * dx + dy * dy) ** 0.5 <= HANDLE_HIT_RADIUS_PX:
-                    return m, idx
-        return None
+                d = ((p[0] - img_pt[0]) ** 2 + (p[1] - img_pt[1]) ** 2) ** 0.5 * self._scale
+                if d <= best_d:
+                    best, best_d = (m, idx), d
+        return best
 
     def _hit_test_polygon_edge_any(self, img_pt: tuple[float, float]) -> tuple[SpecimenMask, int] | None:
         """Возвращает (маску, индекс КУДА вставить новую вершину) для ближайшего
-        ребра среди ВСЕХ полигонов, если клик достаточно близко к какому-то из них,
+        участка кривой среди масок выбранного животного, если клик достаточно близко,
         иначе None."""
         best: tuple[SpecimenMask, int] | None = None
         best_dist = EDGE_HIT_RADIUS_PX / max(self._scale, 1e-6)  # порог в координатах изображения
         p = np.array(img_pt)
+        edge_hit_radius_img = EDGE_HIT_RADIUS_PX / max(self._scale, 1e-6)
         for m in self.masks:
-            if not m.polygon:
+            if not m.polygon or not self._editable(m):
                 continue
-            n = len(m.polygon)
-            for i in range(n):
-                a, b = np.array(m.polygon[i]), np.array(m.polygon[(i + 1) % n])
-                # клик почти точно на одном из концов ребра — это попытка попасть по
-                # СУЩЕСТВУЮЩЕЙ вершине (двойной клик по ней проходит Press на первом
-                # клике, который уже начинает перетаскивание), а не по середине ребра;
-                # не считаем это ребро кандидатом на вставку новой точки, иначе почти
-                # каждый двойной клик по вершине незаметно дублирует её вырожденной
-                # соседней точкой (нулевой длины ребро)
-                edge_hit_radius_img = EDGE_HIT_RADIUS_PX / max(self._scale, 1e-6)
-                if np.linalg.norm(p - a) <= edge_hit_radius_img or np.linalg.norm(p - b) <= edge_hit_radius_img:
-                    continue
-                ab = b - a
-                ab_len2 = float(ab @ ab)
-                t = 0.0 if ab_len2 == 0 else float(np.clip((p - a) @ ab / ab_len2, 0.0, 1.0))
-                closest = a + t * ab
-                dist = float(np.linalg.norm(p - closest))
-                if dist <= best_dist:
-                    best_dist = dist
-                    best = (m, i + 1)
+            # клик почти точно на существующей вершине — это попытка попасть по ней
+            # (двойной клик по вершине проходит Press на первом клике, который уже
+            # начинает перетаскивание), а не по кривой; иначе почти каждый двойной
+            # клик по вершине незаметно дублировал бы её соседней точкой
+            if any(np.linalg.norm(p - np.array(v)) <= edge_hit_radius_img for v in m.polygon):
+                continue
+            # расстояние до плавной кривой (её и видно на экране), ребро i — участок
+            # кривой между вершинами i и i+1
+            curve = smooth_curve(m.polygon)
+            nxt = np.roll(curve, -1, axis=0)
+            ab = nxt - curve
+            ab_len2 = np.maximum((ab * ab).sum(axis=1), 1e-12)
+            t = np.clip(((p - curve) * ab).sum(axis=1) / ab_len2, 0.0, 1.0)
+            dist = np.linalg.norm(curve + t[:, None] * ab - p, axis=1)
+            j = int(np.argmin(dist))
+            if dist[j] <= best_dist:
+                best_dist = float(dist[j])
+                best = (m, j // CURVE_SAMPLES_PER_EDGE + 1)
         return best
 
     def leaveEvent(self, event) -> None:  # noqa: N802
