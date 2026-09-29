@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import html
-import re
 from datetime import datetime
 from pathlib import Path
 
@@ -45,23 +44,125 @@ PIPELINE_TITLES = {
     MaskMode.ROSTRAL_CUT: "Обонятельный эпителий",
 }
 
-_P_VALUE_RE = re.compile(r"(p(?:-value)?\s*[:=]\s*[0-9.]+)")
+# цвета надписей: предупреждение (что-то не так, стоит проверить) и обычная справка
+# («всё в порядке» — не красным, сессия 11: «если предупреждение говорит, что всё ок,
+# не надо его красным делать, сбивает»)
+WARN_STYLE = "color: #b34700; font-weight: bold;"
+INFO_STYLE = "color: #52514e;"
+SIGNIFICANT_COLOR = "#c0262d"
+SIGNIFICANT_BG = "#fde8e8"
+
+# строки из предупреждений кадра, которые ничего плохого не сообщают
+_INFO_PREFIXES = (
+    "Форма черепов найдена по снимку при внешнем свете",
+    "Отброшено как посторонние объекты",
+)
 
 
-def _format_stats_html(lines: list[str]) -> str:
-    """HTML-версия текстового вывода сравнения групп: жирным — p-value (чтобы не
-    искать глазами по строке), цветом предупреждения — уже принятым в программе
-    для похожих предупреждений (`exposure_warning_label`, `slice_warning_label`),
-    а не новым произвольным цветом."""
-    text = "\n".join(lines)
-    html_lines = []
-    for raw_line in text.split("\n"):
-        escaped = html.escape(raw_line)
-        escaped = _P_VALUE_RE.sub(r"<b>\1</b>", escaped)
-        if raw_line.strip().startswith("ВНИМАНИЕ"):
-            escaped = f'<span style="color:#b34700; font-weight:bold;">{escaped}</span>'
-        html_lines.append(escaped or "&nbsp;")
-    return "<br>".join(html_lines)
+def _notes_html(lines: list[tuple[str, bool]]) -> str:
+    """Строки (текст, это предупреждение?) — предупреждения оранжевым, справка серым."""
+    out = []
+    for text, is_warning in lines:
+        if not text:
+            continue
+        style = WARN_STYLE if is_warning else INFO_STYLE
+        out.append(f'<span style="{style}">{html.escape(text).replace(chr(10), "<br>")}</span>')
+    return "<br>".join(out)
+
+
+def _set_notes(label: QLabel, lines: list[tuple[str, bool]]) -> None:
+    label.setTextFormat(Qt.TextFormat.RichText)
+    label.setText(_notes_html(lines))
+
+
+def _classify_shot_warning(text: str | None) -> list[tuple[str, bool]]:
+    return [(line, not line.startswith(_INFO_PREFIXES)) for line in (text or "").split("\n") if line.strip()]
+
+
+def _fmt_p(p: float) -> str:
+    return "< 0.0001" if p < 0.0001 else f"{p:.4f}"
+
+
+def _fmt_num(v: float) -> str:
+    return f"{v:.4g}" if abs(v) < 1000 else f"{v:.0f}"
+
+
+def _higher_first(effect_size: float) -> float:
+    """`mannwhitney_effect_size` = 1 − 2·U₁/(n₁n₂) отрицателен, когда у ПЕРВОЙ группы
+    значения больше; в интерфейсе знак прямой: «+» — у первой (меньший номер) больше."""
+    return -effect_size + 0.0   # + 0.0: без «−0.00»
+
+
+def _stats_html(result, animal_df: pd.DataFrame, metric: str, header: str,
+                warnings: list[str]) -> str:
+    """Сравнение групп таблицами (сессия 11: список «все со всеми» строками было
+    невозможно воспринимать): итог, группы, матрица попарных p — значимое красным."""
+    sig = f"color:{SIGNIFICANT_COLOR}; font-weight:bold;"
+    parts = [f'<p style="{INFO_STYLE}">{html.escape(header)}</p>']
+    if result.p_value < 0.05:
+        verdict = f'<span style="{sig}">p = {_fmt_p(result.p_value)} — есть значимое различие</span>'
+    else:
+        verdict = f"<b>p = {_fmt_p(result.p_value)}</b> — значимого различия не обнаружено"
+    parts.append(f'<p style="font-size:14px;">Общий результат ({html.escape(result.test_name)}): {verdict}</p>')
+
+    cell = 'style="padding:3px 8px; border:1px solid #d6d4cf;"'
+    head = 'style="padding:3px 8px; border:1px solid #d6d4cf; background:#f1f0ec;"'
+    rows = [f"<tr><th {head}>№</th><th {head}>Группа</th><th {head}>n</th>"
+            f"<th {head}>медиана</th><th {head}>среднее ± SD</th></tr>"]
+    for i, g in enumerate(result.groups):
+        vals = animal_df.loc[animal_df["group"] == g, metric].dropna()
+        sd = vals.std(ddof=1) if len(vals) > 1 else 0.0
+        swatch = f'<span style="color:{color_for_group(i)};">■</span>'
+        rows.append(
+            f"<tr><td {cell}>{i + 1}</td><td {cell}>{swatch} {html.escape(str(g))}</td>"
+            f"<td {cell} align='right'>{len(vals)}</td><td {cell} align='right'>{_fmt_num(vals.median())}</td>"
+            f"<td {cell} align='right'>{_fmt_num(vals.mean())} ± {_fmt_num(sd)}</td></tr>"
+        )
+    parts.append('<table cellspacing="0">' + "".join(rows) + "</table>")
+
+    if len(result.groups) > 2:
+        index = {g: i for i, g in enumerate(result.groups)}
+        by_pair = {(index[pw.group_a], index[pw.group_b]): pw for pw in result.pairwise}
+        k = len(result.groups)
+        note = " с поправкой Холма" if result.holm_applied else ""
+        parts.append(f"<p><b>Попарные сравнения</b> (Манн-Уитни, p{note}; номера — из таблицы групп):</p>")
+        rows = ["<tr><th " + head + "></th>" + "".join(f"<th {head}>{j + 1}</th>" for j in range(1, k)) + "</tr>"]
+        for i in range(k - 1):
+            tds = [f"<th {head} align='left'>{i + 1}. {html.escape(str(result.groups[i]))}</th>"]
+            for j in range(1, k):
+                pw = by_pair.get((min(i, j), max(i, j)))
+                if j <= i or pw is None:
+                    tds.append(f"<td {cell} style='background:#f7f6f3;'></td>")
+                    continue
+                small = f"r = {_higher_first(pw.effect_size):+.2f}"
+                if result.holm_applied:
+                    small += f"; без поправки {_fmt_p(pw.p_value_raw)}"
+                if pw.p_value < 0.05:
+                    main = f'<span style="{sig}">{_fmt_p(pw.p_value)}</span>'
+                    bg = f"background:{SIGNIFICANT_BG};"
+                else:
+                    main = _fmt_p(pw.p_value)
+                    bg = ""
+                tds.append(
+                    f"<td style='padding:3px 8px; border:1px solid #d6d4cf; {bg}' align='center'>{main}"
+                    f"<br><span style='color:#7a7873; font-size:10px;'>{small}</span></td>"
+                )
+            rows.append("<tr>" + "".join(tds) + "</tr>")
+        parts.append('<table cellspacing="0">' + "".join(rows) + "</table>")
+    else:
+        pw = result.pairwise[0]
+        r = _higher_first(pw.effect_size)
+        higher = pw.group_a if r > 0 else pw.group_b
+        where = f" (у «{html.escape(str(higher))}» значения больше)" if r else ""
+        parts.append(f"<p>Размер эффекта r = {r:+.2f}{where}</p>")
+    parts.append(
+        f'<p style="{INFO_STYLE}">Красным — p &lt; 0.05. r — размер эффекта (ранговая бисериальная '
+        "корреляция, от −1 до +1; по модулю ≥ 0.5 — большой; знак: + значит, что у группы "
+        "с меньшим номером значения больше).</p>"
+    )
+    for w in warnings:
+        parts.append(f'<p style="{WARN_STYLE}">{html.escape(w)}</p>')
+    return "".join(parts)
 
 
 class ProjectTab(QWidget):
@@ -448,7 +549,6 @@ class ReviewTab(QWidget):
         layout.addWidget(self.progress_label)
 
         self.warning_label = QLabel("")
-        self.warning_label.setStyleSheet("color: #b34700; font-weight: bold;")
         self.warning_label.setWordWrap(True)
         layout.addWidget(self.warning_label)
 
@@ -630,7 +730,7 @@ class ReviewTab(QWidget):
         self.progress_label.setText(
             f"Кадр {self.current_index + 1} из {len(self.reviews)} — {review.shot.display_name}"
         )
-        self.warning_label.setText(review.warning or "")
+        _set_notes(self.warning_label, _classify_shot_warning(review.warning))
         self.find_here_btn.setChecked(False)
         self.canvas.set_shot(review.display_image, review.masks, review.undo_stack, keep_view=keep_view)
         self._refresh_exposure_combo(review)
@@ -986,6 +1086,7 @@ class ResultsTab(QWidget):
         # таблица по срезам на выбранной выдержке — пересчитывается в _refresh_table,
         # остальные контролы (срез, «сравнивать по») берут её отсюда, не перечитывая файлы
         self._filtered_cache: pd.DataFrame | None = None
+        self._skipped_shots: list[str] = []   # кадры без выбранной выдержки (_refresh_table)
 
         layout = QVBoxLayout(self)
 
@@ -1014,13 +1115,11 @@ class ResultsTab(QWidget):
         layout.addLayout(top_row)
 
         self.exposure_warning_label = QLabel("")
-        self.exposure_warning_label.setStyleSheet("color: #b34700; font-weight: bold;")
         self.exposure_warning_label.setWordWrap(True)
         layout.addWidget(self.exposure_warning_label)
 
         self.table_view = QTableView()
         self.table_view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        layout.addWidget(self.table_view, 2)
 
         stats_box = QGroupBox("Сравнение групп")
         stats_layout = QVBoxLayout(stats_box)
@@ -1066,7 +1165,6 @@ class ResultsTab(QWidget):
         stats_layout.addWidget(multi_metric_note)
 
         self.slice_warning_label = QLabel("")
-        self.slice_warning_label.setStyleSheet("color: #b34700; font-weight: bold;")
         self.slice_warning_label.setWordWrap(True)
         stats_layout.addWidget(self.slice_warning_label)
 
@@ -1076,18 +1174,24 @@ class ResultsTab(QWidget):
         results_row = QHBoxLayout()
         self.stats_output = QTextEdit()
         self.stats_output.setReadOnly(True)
-        self.stats_output.setMaximumHeight(260)
-        results_row.addWidget(self.stats_output, 1)
+        self.stats_output.setMinimumHeight(220)
+        results_row.addWidget(self.stats_output, 3)
 
         self.plot_label = QLabel("График появится здесь после «Сравнить группы»")
         self.plot_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.plot_label.setStyleSheet("color: #898781; font-style: italic;")
         self.plot_label.setMinimumSize(360, 260)
-        self.plot_label.setMaximumHeight(260)
-        results_row.addWidget(self.plot_label, 1)
-        stats_layout.addLayout(results_row)
+        results_row.addWidget(self.plot_label, 2)
+        stats_layout.addLayout(results_row, 1)
 
-        layout.addWidget(stats_box)
+        # таблица и сравнение групп — через перетаскиваемую границу: сравнению нужно
+        # место под таблицы групп и попарных p (сессия 11)
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.addWidget(self.table_view)
+        splitter.addWidget(stats_box)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        layout.addWidget(splitter, 1)
 
     def set_reviews(self, reviews: list[ShotReview]) -> None:
         self.reviews = reviews
@@ -1113,9 +1217,21 @@ class ResultsTab(QWidget):
             union |= m
         return union
 
-    def _common_exposures(self) -> list[int]:
-        sets = [set(r.shot.exposure_files) for r in self.reviews if self._accepted_union(r) is not None]
-        return sorted(set.intersection(*sets)) if sets else []
+    def _exposure_coverage(self) -> tuple[dict[int, int], int]:
+        """Сколько кадров с принятыми масками есть на каждой выдержке, и сколько таких
+        кадров всего. Раньше в списке были только выдержки, общие для ВСЕХ кадров, —
+        одного кадра с другими выдержками хватало, чтобы остался лишь пункт «Все
+        выдержки» и статистика не считалась (сессия 11). Теперь в списке все выдержки,
+        кадры без выбранной исключаются с предупреждением."""
+        coverage: dict[int, int] = {}
+        total = 0
+        for r in self.reviews:
+            if self._accepted_union(r) is None:
+                continue
+            total += 1
+            for e in r.shot.exposure_files:
+                coverage[e] = coverage.get(e, 0) + 1
+        return coverage, total
 
     def _saturated_shots(self, exposure: int) -> list[str]:
         """Кадры, у которых на этой выдержке засвет внутри принятых масок."""
@@ -1130,10 +1246,14 @@ class ResultsTab(QWidget):
         return bad
 
     def _refresh_exposure_options(self) -> None:
-        common = self._common_exposures()
+        coverage, total = self._exposure_coverage()
+        # рекомендуемая — среди выдержек с наибольшим охватом кадров (в идеале — все
+        # кадры) самая длинная без засвета в масках
+        best_cover = max(coverage.values(), default=0)
+        widest = sorted((e for e, n in coverage.items() if n == best_cover), reverse=True)
         self.recommended_exposure = None
         saturated: dict[int, list[str]] = {}
-        for exposure in sorted(common, reverse=True):
+        for exposure in widest:
             saturated[exposure] = self._saturated_shots(exposure)
             if not saturated[exposure] and self.recommended_exposure is None:
                 self.recommended_exposure = exposure
@@ -1141,8 +1261,10 @@ class ResultsTab(QWidget):
         current = self.exposure_combo.currentData()
         self.exposure_combo.blockSignals(True)
         self.exposure_combo.clear()
-        for exposure in sorted(common, reverse=True):
+        for exposure in sorted(coverage, reverse=True):
             text = f"{exposure} мс"
+            if coverage[exposure] < total:
+                text += f" (есть у {coverage[exposure]} из {total} кадров)"
             if exposure == self.recommended_exposure:
                 text += " — рекомендуемая"
             elif saturated.get(exposure):
@@ -1152,7 +1274,7 @@ class ResultsTab(QWidget):
         idx = self.exposure_combo.findData(current)
         if idx < 0:
             default = self.recommended_exposure if self.recommended_exposure is not None else (
-                min(common) if common else self.ALL_EXPOSURES
+                min(widest) if widest else self.ALL_EXPOSURES
             )
             idx = self.exposure_combo.findData(default)
         self.exposure_combo.setCurrentIndex(max(idx, 0))
@@ -1161,23 +1283,21 @@ class ResultsTab(QWidget):
 
     def _exposure_note(self) -> str:
         exposure = self.exposure_combo.currentData()
-        common = self._common_exposures()
         if exposure == self.ALL_EXPOSURES:
             return (
                 "Показаны все выдержки каждого кадра (колонка exposure_ms) — это для выгрузки. "
                 "Для сравнения групп выберите одну выдержку."
             )
-        if not common:
-            return (
-                "Нет выдержки, которая есть у ВСЕХ кадров с принятыми масками — сравнивать "
-                "яркость между группами не на чем. Проверьте имена файлов (exp<число>)."
-            )
+        if exposure is None:
+            return ""
         notes = []
         if self.recommended_exposure is None:
             notes.append(
-                "ВНИМАНИЕ: на всех общих выдержках есть засвет внутри масок хотя бы у одного "
-                "кадра — выбрана самая короткая. Яркость в засвеченных местах занижена."
+                "ВНИМАНИЕ: на всех выдержках с наибольшим числом кадров есть засвет внутри масок "
+                "хотя бы у одного кадра — выбрана самая короткая. Яркость в засвеченных местах занижена."
             )
+        if exposure not in self._saturated_by_exposure:
+            self._saturated_by_exposure[exposure] = self._saturated_shots(exposure)
         bad = self._saturated_by_exposure.get(exposure, [])
         if bad and self.recommended_exposure is not None:
             notes.append(
@@ -1220,13 +1340,15 @@ class ResultsTab(QWidget):
 
         filtered, skipped = self._exposure_filtered()
         self._filtered_cache = filtered
-        warnings = []
+        self._skipped_shots = skipped
+        notes: list[tuple[str, bool]] = []
         note = self._exposure_note()
         if note:
-            warnings.append(note)
+            # пояснение к пункту «Все выдержки» — справка, остальное — предупреждения
+            notes.append((note, self.exposure_combo.currentData() != self.ALL_EXPOSURES))
         if skipped:
-            warnings.append("Нет файла с выбранной выдержкой — исключены: " + ", ".join(skipped))
-        self.exposure_warning_label.setText("\n".join(warnings))
+            notes.append(("Нет файла с выбранной выдержкой — исключены: " + ", ".join(skipped), True))
+        _set_notes(self.exposure_warning_label, notes)
         if self.average_checkbox.isChecked():
             df = per_animal_average(filtered)
         else:
@@ -1304,11 +1426,11 @@ class ResultsTab(QWidget):
         part = part[:1].upper() + part[1:]
         what = "этой половины" if isinstance(slice_index, str) else "этого среза"
         if dropped:
-            self.slice_warning_label.setText(
-                f"{part}: исключено из сравнения животных без {what} — {dropped}."
-            )
+            _set_notes(self.slice_warning_label,
+                       [(f"{part}: исключено из сравнения животных без {what} — {dropped}.", True)])
         else:
-            self.slice_warning_label.setText(f"{part}: есть у всех животных, никто не исключён.")
+            _set_notes(self.slice_warning_label,
+                       [(f"{part}: есть у всех животных, никто не исключён.", False)])
 
     def _show_dataframe(self, df: pd.DataFrame) -> None:
         # сортировка по группе уже применена вызывающим кодом (_refresh_table) —
@@ -1452,47 +1574,35 @@ class ResultsTab(QWidget):
                          else "единица анализа — животное, срезы усреднены")
         else:
             unit_note = f"единица анализа — животное, только {self._part_text(slice_index)}"
-        lines = [
-            f"Метод: {result.test_name} ({unit_note})",
-            f"Группы: {', '.join(f'{g} (n={result.n_per_group[g]})' for g in result.groups)}",
-            f"Общий p-value: {result.p_value:.4f}" + ("  (есть значимое различие, p < 0.05)" if result.p_value < 0.05 else "  (значимого различия не обнаружено)"),
-        ]
+        exposure = self.exposure_combo.currentData()
+        header = f"{self.metric_combo.currentText()} · выдержка {exposure} мс · {unit_note}"
+        warnings: list[str] = []
+        if self._skipped_shots:
+            warnings.append(
+                f"ВНИМАНИЕ: нет файла с выдержкой {exposure} мс — не вошли в сравнение кадры: "
+                + ", ".join(self._skipped_shots)
+            )
         if slice_index is not None:
             _, dropped = self._slice_filter_info()
             if dropped:
-                lines.append(
-                    f"\nВНИМАНИЕ: при выборе «{self._part_text(slice_index)}» исключено животных "
+                warnings.append(
+                    f"ВНИМАНИЕ: при выборе «{self._part_text(slice_index)}» исключено животных "
                     f"без неё — {dropped}. Результат относится только к оставшимся."
                 )
-
-        exposure = self.exposure_combo.currentData()
-        lines.insert(1, f"Выдержка: {exposure} мс (одна и та же у всех кадров)")
         bad = self._saturated_by_exposure.get(exposure, [])
         if bad:
-            lines.append(
-                f"\nВНИМАНИЕ: на этой выдержке есть засвет внутри масок ({', '.join(bad)}) — "
+            warnings.append(
+                f"ВНИМАНИЕ: на этой выдержке есть засвет внутри масок ({', '.join(bad)}) — "
                 "яркость там занижена. Лучше взять рекомендуемую выдержку."
             )
         min_p = max((pw.min_possible_p for pw in result.pairwise), default=0.0)
         if min_p > 0.05:
-            lines.append(
-                f"\nВНИМАНИЕ: при таком числе животных наименьшее в принципе достижимое "
+            warnings.append(
+                f"ВНИМАНИЕ: при таком числе животных наименьшее в принципе достижимое "
                 f"p-value = {min_p:.3f} — тест физически не может показать p < 0.05, даже "
-                f"если реальный эффект есть. \"Незначимо\" здесь не означает \"эффекта нет\"."
+                f"если реальный эффект есть. «Незначимо» здесь не означает «эффекта нет»."
             )
-        if len(result.pairwise) > 1:
-            note = " (с поправкой Холма на множественные сравнения)" if result.holm_applied else ""
-            lines.append(f"\nПопарные сравнения{note}:")
-            for pw in result.pairwise:
-                extra = f", было бы p = {pw.p_value_raw:.4f} без поправки" if result.holm_applied else ""
-                lines.append(
-                    f"  {pw.group_a} vs {pw.group_b}: p = {pw.p_value:.4f}{extra}; "
-                    f"размер эффекта (ранговая бисериальная корреляция) = {pw.effect_size:+.2f}"
-                )
-        else:
-            pw = result.pairwise[0]
-            lines.append(f"Размер эффекта (ранговая бисериальная корреляция): {pw.effect_size:+.2f}")
-        self.stats_output.setHtml(_format_stats_html(lines))
+        self.stats_output.setHtml(_stats_html(result, animal_df, metric, header, warnings))
 
         png_bytes = boxplot_png_bytes(animal_df, metric, title=self.metric_combo.currentText() + self._plot_title_suffix())
         pixmap = QPixmap()

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from .editing import resolve_overlaps
 from .models import NOSE_SIDES, GroupConfig, MaskMode, SpecimenMask
 
 # минимальная площадь пятна в пикселях, чтобы не путать шум/пыль/битые пиксели с животным
@@ -714,6 +715,8 @@ NOSE_MIN_CONTRAST = 1.3
 NOSE_EXTEND_FRACTION = 0.5
 # сглаживание нижнего края по расстоянию от оси (px)
 NOSE_BOTTOM_SMOOTH_PX = 7
+# найденный по яркости низ опускается на эту долю длины носа (не ниже ограничителя)
+NOSE_BOTTOM_MARGIN = 0.08
 # узкие выступы нижнего края вниз уже этой доли ширины половины срезаются; узкие
 # вырезы вверх (тёмный клин у оси) остаются
 NOSE_SPIKE_FRACTION = 0.35
@@ -823,6 +826,9 @@ def nose_halves(
     prof = _cut_narrow_spikes(prof, max(9, int(len(prof) * NOSE_SPIKE_FRACTION)))
     prof = np.minimum(prof, np.percentile(prof, 70) + 0.1 * nose_len)
     prof = _smooth_rows(prof, NOSE_BOTTOM_SMOOTH_PX)
+    # порог на полпути между носом и черепом отрезает по середине спада яркости —
+    # свечение кончается ниже (сессия 11: «полукруг стабильно выше»)
+    prof = prof + NOSE_BOTTOM_MARGIN * nose_len
     prof = np.r_[prof, np.full(n - len(prof), prof[-1])]
     bottom = prof[np.clip(dist.astype(int), 0, n - 1)]
     above = yy <= bottom
@@ -901,6 +907,7 @@ def build_masks_for_image(
             others = [b for b in assigned if b is not blob] + leftovers
             grown = grow_blob_to_soft_edge(image, blob, others)
             masks.append(SpecimenMask(animal_index=animal_index, slice_index=slice_index, mask=grown.mask))
+        resolve_overlaps(masks)
         return masks, warning
 
     # ROSTRAL_CUT: у каждого животного две маски — левая (slice_index 0) и правая (1)
@@ -949,6 +956,7 @@ def build_masks_for_image(
         warning = f"{warning}\n{note}" if warning else note
 
     masks.sort(key=lambda m: (m.animal_index, m.slice_index))
+    resolve_overlaps(masks)
     return masks, warning
 
 
@@ -990,9 +998,11 @@ def recompute_rostral_mask_from_line(
 # сколько нужно, чтобы кривая совпала с маской (POLYGON_FIT_IOU), но не больше
 # POLYGON_MAX_POINTS. Раньше было до 40 точек с прямыми рёбрами — на фото с пятью
 # носами по две половины выходило ~400 точек, «непонятно, какие тянуть».
-POLYGON_MAX_POINTS = 24
-POLYGON_MIN_POINTS = 6
-POLYGON_FIT_IOU = 0.95
+# Сессия 11 («многовато точек»): до 10 точек (срез ~5–6, половина носа ~9) — правка
+# точками местная (`apply_polygon_edit`), неточность кривой маску не огрубляет.
+POLYGON_MAX_POINTS = 10
+POLYGON_MIN_POINTS = 5
+POLYGON_FIT_IOU = 0.90
 # сколько точек кривой рисуется/растеризуется на каждое ребро между вершинами
 CURVE_SAMPLES_PER_EDGE = 12
 
@@ -1093,19 +1103,17 @@ def apply_polygon_edit(
     маски. `mask_to_polygon` обводит только самую большую область — если до правки
     точками в маске было несколько отдельных кусков (например, дорисованных кистью),
     простая замена `mask = polygon_to_mask(new_polygon)` молча выкидывала бы все
-    остальные. Сохраняются связные компоненты `old_mask`, которые НЕ пересекаются
-    со старым полигоном (то есть не та область, которую полигон и представлял);
-    компонента под полигоном целиком заменяется новым контуром."""
+    остальные.
+
+    С сессии 11 правка местная: меняются только пиксели, где старая и новая кривая
+    расходятся (около передвинутой точки), остальная маска остаётся попиксельно как
+    была — поэтому точек может быть немного, а маска не огрубляется до кривой."""
     new_mask = polygon_to_mask(new_polygon, old_mask.shape)
     if not old_mask.any():
         return new_mask
-    n_labels, labels = cv2.connectedComponents(old_mask.astype(np.uint8), connectivity=8)
-    if n_labels <= 2:  # фон + одна область — сохранять нечего
-        return new_mask
     old_poly_mask = polygon_to_mask(old_polygon, old_mask.shape)
-    covered = np.unique(labels[old_poly_mask & old_mask])
-    keep = old_mask & ~np.isin(labels, covered)
-    return new_mask | keep
+    changed = old_poly_mask != new_mask
+    return np.where(changed, new_mask, old_mask)
 
 
 # --- «Поищи здесь»: поиск пропущенного среза вокруг клика (сессия 7) ---

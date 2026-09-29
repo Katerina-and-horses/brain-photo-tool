@@ -10,6 +10,7 @@ from PySide6.QtGui import QBrush, QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QWidget
 
 from .colors import color_for_animal
+from .editing import claim_pixels
 from .models import MaskMode, SpecimenMask, part_label
 from .segmentation import (
     CURVE_SAMPLES_PER_EDGE, apply_polygon_edit, mask_to_polygon, recompute_rostral_mask_from_line,
@@ -563,6 +564,7 @@ class MaskCanvas(QWidget):
                         m.cut_line = None
                         m.source_blob = None
                         m.accepted = False
+                        claim_pixels(self.masks, m)
                         self.maskEdited.emit()
                     self.update()
                     return
@@ -688,6 +690,7 @@ class MaskCanvas(QWidget):
             m.cut_line = None
             m.source_blob = None
             m.accepted = False
+            claim_pixels(self.masks, m)
             self._dragging_polygon_vertex = None
             self.maskEdited.emit()
             self.update()
@@ -714,6 +717,7 @@ class MaskCanvas(QWidget):
                 # "принято", и перетащенная-но-непроверенная маска могла остаться
                 # помеченной как принятая
                 m.accepted = False
+                claim_pixels(self.masks, m)
             self._dragging_handle = None
             self.maskEdited.emit()
             self.update()
@@ -745,6 +749,7 @@ class MaskCanvas(QWidget):
         m.cut_line = None
         m.source_blob = None
         m.accepted = False
+        claim_pixels(self.masks, m)
         self._set_active(m)
         self.maskEdited.emit()
         self.update()
@@ -837,13 +842,23 @@ class MaskCanvas(QWidget):
         target.polygon = None
 
         h, w = target.mask.shape
-        yy, xx = np.ogrid[:h, :w]
         cx, cy = img_pt
-        dist2 = (xx - cx) ** 2 + (yy - cy) ** 2
-        brush = dist2 <= self.brush_radius_img ** 2
+        r = self.brush_radius_img
+        y0, y1 = max(int(cy - r), 0), min(int(cy + r) + 2, h)
+        x0, x1 = max(int(cx - r), 0), min(int(cx + r) + 2, w)
+        if y0 >= y1 or x0 >= x1:
+            return
+        # только в рамке кисти — на весь кадр это заметно тормозило бы с вычитанием
+        # из соседей на каждое движение мыши
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        brush = (xx - cx) ** 2 + (yy - cy) ** 2 <= r ** 2
+        window = (slice(y0, y1), slice(x0, x1))
+        target.mask = target.mask.copy()
         if self.erase_mode:
-            target.mask = target.mask & ~brush
+            target.mask[window] &= ~brush
         else:
-            target.mask = target.mask | brush
+            target.mask[window] |= brush
+            # закрашенное забирается у соседних масок — один пиксель в одной маске
+            claim_pixels(self.masks, target, window)
         target.accepted = False
         self.update()

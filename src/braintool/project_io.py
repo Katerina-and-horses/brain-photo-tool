@@ -25,6 +25,7 @@ import numpy as np
 from .imaging import (
     choose_mask_exposure, contrast_stretch_to_uint8, is_reference_file, load_image, scan_group_folder,
 )
+from .editing import resolve_overlaps
 from .models import GroupConfig, MaskMode, ShotReview, SpecimenMask
 
 FORMAT_VERSION = 1
@@ -188,6 +189,14 @@ def load_markup(path: Path) -> LoadedMarkup:
                 rostral_anchor=tuple(e["rostral_anchor"]) if e.get("rostral_anchor") else None,
                 polygon=[tuple(p) for p in e["polygon"]] if e.get("polygon") else None,
             ))
+        # разметка до сессии 11 могла содержать пересекающиеся маски (один кусок в
+        # двух масках считался дважды) — разводим при загрузке
+        shared = resolve_overlaps(masks)
+        if shared:
+            problems.append(
+                f"Группа «{s['group']}», кадр «{s['shot_key']}»: маски пересекались "
+                f"({shared} пикс.) — общие места отданы ближайшей маске, проверьте этот кадр."
+            )
         reviews.append(ShotReview(
             shot=shot, image=image, display_image=contrast_stretch_to_uint8(image),
             masks=masks, warning=s.get("warning"),

@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import cv2
 import numpy as np
 
 from .models import SpecimenMask
@@ -219,3 +220,89 @@ def move_animal(masks: list[SpecimenMask], animal_index: int, dest: int, new_ani
         m.accepted = False
     masks.extend(group)
     masks.sort(key=lambda x: (x.animal_index, x.slice_index))
+
+
+# --- маски не пересекаются (сессия 11) ---
+# Один и тот же пиксель не должен попадать в две маски — иначе один кусок ткани
+# считается дважды (жалоба: «перекрещиваются маски, один фрагмент учитывается
+# несколько раз»). Правило: последняя правка побеждает — то, что маска забрала
+# кистью / точками, вычитается из соседей на том же фото.
+
+def _detach(m: SpecimenMask) -> None:
+    """Маска стала чисто растровой: контур точек перестроится по ней заново, линия
+    отреза к ней больше не относится."""
+    m.polygon = None
+    m.cut_line = None
+    m.source_blob = None
+
+
+def claim_pixels(masks: list[SpecimenMask], owner: SpecimenMask,
+                 region: tuple[slice, slice] | None = None) -> list[SpecimenMask]:
+    """Убирает пиксели `owner` из всех остальных масок. `region` — рамка, где могла
+    появиться новая часть owner (кисть), чтобы не перебирать весь кадр на каждое
+    движение мыши. Возвращает изменённые соседние маски."""
+    changed: list[SpecimenMask] = []
+    window = region if region is not None else (slice(None), slice(None))
+    own = owner.mask[window]
+    if not own.any():
+        return changed
+    for other in masks:
+        if other is owner:
+            continue
+        overlap = other.mask[window] & own
+        if not overlap.any():
+            continue
+        other.mask = other.mask.copy()
+        other.mask[window] &= ~overlap
+        _detach(other)
+        changed.append(other)
+    return changed
+
+
+def resolve_overlaps(masks: list[SpecimenMask]) -> int:
+    """Разводит уже существующие пересечения (разметка, сохранённая до сессии 11):
+    общий пиксель достаётся той маске, чья собственная (ни с кем не общая) часть
+    ближе. Возвращает число пикселей, которые были общими."""
+    live = [m for m in masks if m.mask.any()]
+    if len(live) < 2:
+        return 0
+    count = np.zeros(live[0].mask.shape, dtype=np.uint8)
+    for m in live:
+        count += m.mask
+    shared = count > 1
+    n_shared = int(shared.sum())
+    if not n_shared:
+        return 0
+    ys, xs = np.nonzero(shared)
+    pad = 5
+    y0, y1 = max(ys.min() - pad, 0), ys.max() + pad + 1
+    x0, x1 = max(xs.min() - pad, 0), xs.max() + pad + 1
+    involved = [m for m in live if (m.mask[y0:y1, x0:x1] & shared[y0:y1, x0:x1]).any()]
+    # расстояние до собственной части каждой маски — в рамке вокруг общих пикселей,
+    # с запасом, чтобы собственная часть в неё попала
+    h, w = shared.shape
+    for m in involved:
+        mys, mxs = np.nonzero(m.mask & ~shared)
+        if len(mys):
+            y0, y1 = min(y0, mys.min()), max(y1, mys.max() + 1)
+            x0, x1 = min(x0, mxs.min()), max(x1, mxs.max() + 1)
+    y1, x1 = min(y1, h), min(x1, w)
+    box = (slice(y0, y1), slice(x0, x1))
+    dists = []
+    for m in involved:
+        own = (m.mask[box] & ~shared[box]).astype(np.uint8)
+        if own.any():
+            d = cv2.distanceTransform(1 - own, cv2.DIST_L2, 3)
+        else:
+            d = np.full(own.shape, np.inf, dtype=np.float32)
+        d[~m.mask[box]] = np.inf   # пиксель достаётся только одной из масок, где он был
+        dists.append(d)
+    winner = np.argmin(np.stack(dists), axis=0)
+    shared_box = shared[box]
+    for i, m in enumerate(involved):
+        lose = shared_box & (winner != i) & m.mask[box]
+        if lose.any():
+            m.mask = m.mask.copy()
+            m.mask[box] &= ~lose
+            _detach(m)
+    return n_shared
