@@ -6,11 +6,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .models import MaskMode, MeasurementRow, ShotReview, nose_side
+from .models import GroupConfig, MaskMode, MeasurementRow, ShotReview, mask_group, nose_side
 
 
 def measure_shot(
-    review: ShotReview, image: np.ndarray | None = None, exposure_ms: int | None = None
+    review: ShotReview, image: np.ndarray | None = None, exposure_ms: int | None = None,
+    groups: dict[str, GroupConfig] | None = None,
 ) -> list[MeasurementRow]:
     """Считает площадь/среднее/разброс только для масок, которые приняты пользователем.
 
@@ -21,6 +22,10 @@ def measure_shot(
     и той же выдержке достаточно передать сюда изображение другого файла выдержки
     того же кадра (`shot.exposure_files[нужная_выдержка]`) — маску пересчитывать не
     нужно, площадь не изменится, а яркость посчитается корректно по нужному файлу.
+
+    Животное с отдельной группой (`SpecimenMask.group`, сессия 12) пишется в свою
+    группу; «Контроль?» и «Условие» берутся у этой группы из `groups` (название →
+    настройки), у группы, которой нет на вкладке «Проект», — опыт без условия.
     """
     image = review.image if image is None else image
     exposure_ms = review.shot.chosen_exposure if exposure_ms is None else exposure_ms
@@ -32,9 +37,14 @@ def measure_shot(
         if area == 0:
             continue
         values = image[m.mask].astype(np.float64)
+        name = mask_group(review.shot, m)
+        if name == review.shot.group.name:
+            cfg = review.shot.group
+        else:
+            cfg = (groups or {}).get(name)
         rows.append(
             MeasurementRow(
-                group=review.shot.group.name,
+                group=name,
                 animal_index=m.animal_index,
                 slice_index=m.slice_index,
                 area_px=area,
@@ -43,8 +53,8 @@ def measure_shot(
                 source_file=review.shot.display_name,
                 mode=review.shot.group.mode.value,
                 exposure_ms=exposure_ms,
-                is_control=review.shot.group.is_control,
-                condition=review.shot.group.condition,
+                is_control=cfg.is_control if cfg is not None else False,
+                condition=cfg.condition if cfg is not None else "",
                 side=nose_side(review.masks, m) if review.shot.group.mode == MaskMode.ROSTRAL_CUT else "",
             )
         )

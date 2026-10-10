@@ -60,6 +60,11 @@ class GroupConfig:
     # сравнения "все со всеми" по этой метке в результатах, когда одного деления
     # на группы недостаточно
     condition: str = ""
+    # несколько папок с ОДНИМ названием группы — одна группа (сессия 12). Чтобы кадры
+    # с одинаковыми именами файлов из разных папок не слились в одних «животных», у
+    # таких папок метка папки входит в имя кадра (`Shot.display_name`); у группы из
+    # одной папки метка пустая. Заполняется `folders.label_merged_groups`
+    folder_label: str = ""
 
     def __post_init__(self) -> None:
         if self.cols < 1:
@@ -86,6 +91,8 @@ class Shot:
 
     @property
     def display_name(self) -> str:
+        if self.group.folder_label:
+            return f"{self.group.name} / {self.group.folder_label} / {self.shot_key}"
         return f"{self.group.name} / {self.shot_key}"
 
 
@@ -112,6 +119,15 @@ class SpecimenMask:
     # площади/яркости — полигон это только способ её РЕДАКТИРОВАТЬ, при любом
     # изменении вершин полигон растеризуется обратно в mask (canvas.py)
     polygon: list[tuple[float, float]] | None = None
+    # группа животного, если она не та, что у папки кадра (сессия 12: на одном фото
+    # животные разных групп). None — группа папки. У всех масок одного животного
+    # одна и та же группа — это поддерживают функции `editing.py`
+    group: str | None = None
+
+
+def mask_group(shot: Shot, m: SpecimenMask) -> str:
+    """Группа, к которой относится маска: своя у животного или группа папки кадра."""
+    return m.group or shot.group.name
 
 
 @dataclass

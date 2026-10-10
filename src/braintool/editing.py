@@ -102,6 +102,22 @@ def _compact(masks: list[SpecimenMask]) -> None:
     masks.sort(key=lambda m: (m.animal_index, m.slice_index))
 
 
+def animal_group(masks: list[SpecimenMask], animal_index: int) -> str | None:
+    """Своя группа животного (сессия 12) или None — группа папки кадра."""
+    for m in masks:
+        if m.animal_index == animal_index:
+            return m.group
+    return None
+
+
+def set_animal_group(masks: list[SpecimenMask], animal_index: int, group: str | None) -> None:
+    """Переводит животное (все его срезы / обе половины носа) в группу `group`;
+    None — обратно в группу папки."""
+    for m in masks:
+        if m.animal_index == animal_index:
+            m.group = group
+
+
 def add_mask(
     masks: list[SpecimenMask],
     new_mask: np.ndarray,
@@ -120,7 +136,9 @@ def add_mask(
     else:
         slice_index = _slice_position_by_y(masks, animal_index, new_mask)
         _make_room_for_slice(masks, animal_index, slice_index)
-    m = SpecimenMask(animal_index=animal_index, slice_index=slice_index, mask=new_mask)
+    # срез уже известного животного — в его группе; новое животное — в группе папки
+    group = None if new_animal else animal_group(masks, animal_index)
+    m = SpecimenMask(animal_index=animal_index, slice_index=slice_index, mask=new_mask, group=group)
     masks.append(m)
     masks.sort(key=lambda x: (x.animal_index, x.slice_index))
     return m
@@ -154,6 +172,9 @@ def move_mask(
         slice_index = min(slice_index, len(slices_of(masks, animal_index)))
         _make_room_for_slice(masks, animal_index, slice_index)
         m.animal_index, m.slice_index = animal_index, slice_index
+        # срез, перенесённый к другому животному, переходит в группу этого животного
+        if any(o.animal_index == animal_index for o in masks):
+            m.group = animal_group(masks, animal_index)
     m.accepted = False
     masks.append(m)
     _compact(masks)

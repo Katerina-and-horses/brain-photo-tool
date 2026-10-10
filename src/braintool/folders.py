@@ -123,3 +123,28 @@ def data_dir_for(groups) -> Path:
     except ValueError:  # разные диски Windows
         common = Path(tops[0])
     return common if common.is_dir() else Path.home()
+
+
+def label_merged_groups(groups: list) -> None:
+    """Несколько папок с одним названием группы — одна группа (сессия 12). Каждой
+    такой папке даётся метка (`GroupConfig.folder_label`) — имя папки группы, а если
+    это подпапка пайплайна («срезы») — имя папки над ней; совпавшие метки получают
+    « (2)». Метка входит в имя кадра, поэтому кадры «1.tif» из двух папок одной группы
+    не сливаются в одних и тех же «животных». У группы из одной папки метка пустая."""
+    counts: dict[str, int] = {}
+    for g in groups:
+        counts[g.name] = counts.get(g.name, 0) + 1
+    used: dict[str, set[str]] = {}
+    for g in groups:
+        if counts[g.name] < 2:
+            g.folder_label = ""
+            continue
+        folder = Path(g.folder)
+        base = folder.parent.name if is_pipeline_subfolder(folder, g.mode) else folder.name
+        base = base or str(folder)
+        taken = used.setdefault(g.name, set())
+        label, n = base, 2
+        while label in taken:
+            label, n = f"{base} ({n})", n + 1
+        taken.add(label)
+        g.folder_label = label

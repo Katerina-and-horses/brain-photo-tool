@@ -26,6 +26,7 @@ from .imaging import (
     choose_mask_exposure, contrast_stretch_to_uint8, is_reference_file, load_image, scan_group_folder,
 )
 from .editing import resolve_overlaps
+from .folders import label_merged_groups
 from .models import GroupConfig, MaskMode, ShotReview, SpecimenMask
 
 FORMAT_VERSION = 1
@@ -45,6 +46,7 @@ def save_markup(
     path: Path, mode: MaskMode, groups: list[GroupConfig], reviews: list[ShotReview], current_index: int,
 ) -> None:
     arrays: dict[str, np.ndarray] = {}
+    group_index = {id(g): i for i, g in enumerate(groups)}
     shots = []
     for ri, review in enumerate(reviews):
         masks = []
@@ -60,6 +62,7 @@ def save_markup(
                 "rostral_anchor": list(m.rostral_anchor) if m.rostral_anchor is not None else None,
                 "polygon": [list(p) for p in m.polygon] if m.polygon else None,
                 "source_blob": None,
+                "group": m.group,
             }
             if m.source_blob is not None:
                 arrays[key + "_src"] = _pack(m.source_blob)
@@ -67,6 +70,9 @@ def save_markup(
             masks.append(entry)
         shots.append({
             "group": review.shot.group.name,
+            # имена групп могут повторяться (несколько папок — одна группа, сессия 12),
+            # поэтому кадр ссылается на группу по номеру в списке "groups"
+            "group_index": group_index.get(id(review.shot.group)),
             "shot_key": review.shot.shot_key,
             "exposure": review.shot.chosen_exposure,
             "shape": list(review.image.shape[:2]),
@@ -131,26 +137,39 @@ def load_markup(path: Path) -> LoadedMarkup:
     mode = MaskMode(meta["mode"])
     problems: list[str] = []
 
-    groups: dict[str, GroupConfig] = {}
-    shots_by_group: dict[str, dict] = {}
+    # по номеру в списке; None — папка не найдена (её кадры пропускаются)
+    loaded_groups: list[GroupConfig | None] = []
+    shots_by_group: list[dict] = []
     for g in meta["groups"]:
         folder = _resolve_folder(g["folder"], path)
         if folder is None:
             problems.append(f"Группа «{g['name']}»: папка не найдена ({g['folder']}) — её кадры пропущены.")
+            loaded_groups.append(None)
+            shots_by_group.append({})
             continue
         group = GroupConfig(
             name=g["name"], folder=folder, mode=mode, cols=g["cols"], rows=g.get("rows"),
             is_control=g.get("is_control", False), condition=g.get("condition", ""),
         )
-        groups[group.name] = group
-        shots_by_group[group.name] = {s.shot_key: s for s in scan_group_folder(group)}
+        loaded_groups.append(group)
+        shots_by_group.append({})
+    groups = [g for g in loaded_groups if g is not None]
+    # метка папки — до сканирования: она входит в имя кадра
+    label_merged_groups(groups)
+    for i, group in enumerate(loaded_groups):
+        if group is not None:
+            shots_by_group[i] = {s.shot_key: s for s in scan_group_folder(group)}
+    # разметка до сессии 12 ссылается на группу только по имени (тогда имена не повторялись)
+    index_by_name = {g["name"]: i for i, g in enumerate(meta["groups"])}
 
     reviews: list[ShotReview] = []
     for s in meta["shots"]:
-        group = groups.get(s["group"])
-        if group is None:
+        gi = s.get("group_index")
+        if gi is None:
+            gi = index_by_name.get(s["group"])
+        if gi is None or not 0 <= gi < len(loaded_groups) or loaded_groups[gi] is None:
             continue
-        shot = shots_by_group[s["group"]].get(s["shot_key"])
+        shot = shots_by_group[gi].get(s["shot_key"])
         if shot is None:
             if is_reference_file(Path(s["shot_key"])):
                 problems.append(
@@ -188,6 +207,7 @@ def load_markup(path: Path) -> LoadedMarkup:
                 source_blob=_unpack(arrays[e["source_blob"]], shape) if e.get("source_blob") else None,
                 rostral_anchor=tuple(e["rostral_anchor"]) if e.get("rostral_anchor") else None,
                 polygon=[tuple(p) for p in e["polygon"]] if e.get("polygon") else None,
+                group=e.get("group"),
             ))
         # разметка до сессии 11 могла содержать пересекающиеся маски (один кусок в
         # двух масках считался дважды) — разводим при загрузке
@@ -202,7 +222,7 @@ def load_markup(path: Path) -> LoadedMarkup:
             masks=masks, warning=s.get("warning"),
         ))
     current = min(int(meta.get("current_index", 0)), max(len(reviews) - 1, 0))
-    return LoadedMarkup(mode=mode, groups=list(groups.values()), reviews=reviews,
+    return LoadedMarkup(mode=mode, groups=groups, reviews=reviews,
                         current_index=current, problems=problems)
 
 
