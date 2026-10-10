@@ -10,11 +10,11 @@ import numpy as np
 import pandas as pd
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import (
-    QBrush, QColor, QKeySequence, QPixmap, QShortcut, QStandardItem, QStandardItemModel,
+    QAction, QBrush, QColor, QKeySequence, QPixmap, QShortcut, QStandardItem, QStandardItemModel,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QFileSystemModel, QListView, QTreeView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-    QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QMessageBox,
+    QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QMenu, QMessageBox,
     QPushButton, QScrollArea, QSpinBox, QSplitter, QTableView, QTableWidget,
     QTableWidgetItem, QTabWidget, QTextEdit, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
     QWidget,
@@ -23,9 +23,10 @@ from PySide6.QtWidgets import (
 from .canvas import MaskCanvas
 from .colors import color_for_animal
 from .editing import (
-    add_mask, animal_count, clear_or_delete_side, delete_mask, move_animal, move_mask, slices_of,
+    add_mask, animal_count, animal_group, clear_or_delete_side, delete_mask, move_animal, move_mask,
+    set_animal_group, slices_of,
 )
-from .folders import SUBFOLDER_TITLES, data_dir_for, find_group_folders
+from .folders import SUBFOLDER_TITLES, data_dir_for, find_group_folders, label_merged_groups
 from .imaging import (
     MASK_SATURATION_FRACTION_LIMIT, choose_mask_exposure, contrast_stretch_to_uint8, load_image, load_reference,
     mask_saturation_fraction, scan_group_folder, unsaturated_exposures,
@@ -182,7 +183,8 @@ class ProjectTab(QWidget):
             f"Добавьте папки групп животных — кнопкой ниже или перетащив их мышью в это окно "
             f"(можно несколько сразу). Внутри папки группы программа сама возьмёт подпапку "
             f"«{sub}»; если перетащить папку всего исследования — добавятся все группы в ней. "
-            "Название группы = имя папки (поменять — двойной клик по названию).\n"
+            "Название группы = имя папки (поменять — двойной клик по названию). Папки с "
+            "одинаковым названием считаются одной группой.\n"
             "Для каждой группы укажите:\n"
             "— сколько животных на одном фото (по горизонтали, слева направо);\n"
             "— контрольная это группа или опытная (для сравнения «контроль vs опыт»);\n"
@@ -382,7 +384,7 @@ class ProjectTab(QWidget):
 
     def _collect_groups(self) -> list[GroupConfig] | None:
         groups: list[GroupConfig] = []
-        seen_names: set[str] = set()
+        first_of: dict[str, GroupConfig] = {}
         for row in range(self.table.rowCount()):
             name = self.table.item(row, 0).text().strip()
             folder = self.table.item(row, 1).text()
@@ -390,37 +392,39 @@ class ProjectTab(QWidget):
             is_control = self.table.cellWidget(row, 3).findChild(QCheckBox).isChecked()
             condition_item = self.table.item(row, 4)
             condition = condition_item.text().strip() if condition_item else ""
-            # название группы редактируется прямо в ячейке таблицы (двойной клик) —
-            # пустое или повторяющееся имя молча сливает разные папки/животных в один
-            # ряд статистики (per_animal_average группирует именно по этому имени)
+            # название группы редактируется прямо в ячейке таблицы (двойной клик)
             if not name:
                 QMessageBox.warning(
                     self, "Пустое название группы",
                     f"Строка {row + 1}: укажите название группы (сейчас пусто).",
                 )
                 return None
-            if name in seen_names:
+            # одинаковое название = одна группа из нескольких папок (сессия 12); метки
+            # «Контроль?» / «Условие» у группы одни — разные метки значат, что папки
+            # объединили по ошибке
+            first = first_of.get(name)
+            if first is not None and (first.is_control, first.condition) != (is_control, condition):
                 QMessageBox.warning(
-                    self, "Повторяющееся название группы",
-                    f"Название «{name}» использовано больше одного раза — разные папки "
-                    "с одинаковым именем группы молча объединятся в статистике в одну "
-                    "группу. Переименуйте одну из них.",
+                    self, "Разные отметки у одной группы",
+                    f"Папки с названием «{name}» объединяются в одну группу, но у них разные "
+                    "отметки «Контроль?» или «Условие». Сделайте отметки одинаковыми — или "
+                    "дайте папкам разные названия, если это разные группы.",
                 )
                 return None
-            seen_names.add(name)
             try:
-                groups.append(
-                    GroupConfig(
-                        name=name, folder=Path(folder), mode=self.mode,
-                        cols=cols, is_control=is_control, condition=condition,
-                    )
+                group = GroupConfig(
+                    name=name, folder=Path(folder), mode=self.mode,
+                    cols=cols, is_control=is_control, condition=condition,
                 )
             except Exception as exc:  # noqa: BLE001
                 QMessageBox.warning(self, "Ошибка настройки группы", f"Группа «{name}»: {exc}")
                 return None
+            groups.append(group)
+            first_of.setdefault(name, group)
         if not groups:
             QMessageBox.information(self, "Нет групп", "Добавьте хотя бы одну папку с группой.")
             return None
+        label_merged_groups(groups)
         return groups
 
     def _start_review(self) -> None:
@@ -586,6 +590,20 @@ class ReviewTab(QWidget):
         row.addWidget(self.reassign_btn)
         row.addWidget(self.delete_btn)
         lay.addLayout(row)
+        # группа животного (сессия 12): по умолчанию — группа папки фото, но на одном
+        # фото могут лежать животные разных групп
+        self.group_btn = QPushButton("Группа животного…")
+        self.group_btn.setToolTip(
+            "Отнести выбранное животное (все его маски) к другой группе. По умолчанию все "
+            "животные на фото — в группе своей папки. То же меню — правой кнопкой по "
+            "животному в списке выше"
+        )
+        self.group_btn.clicked.connect(
+            lambda: self._show_group_menu(self.group_btn.mapToGlobal(self.group_btn.rect().bottomLeft()))
+        )
+        lay.addWidget(self.group_btn)
+        self.mask_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.mask_tree.customContextMenuRequested.connect(self._on_tree_context_menu)
         side_layout.addWidget(box)
 
         # --- добавить (только срезы: у черепов маска на животное одна) ---
@@ -745,6 +763,7 @@ class ReviewTab(QWidget):
         has_active = self.canvas.active_mask() is not None
         self.reassign_btn.setEnabled(has_active)
         self.delete_btn.setEnabled(has_active)
+        self.group_btn.setEnabled(has_active)
         self.undo_btn.setEnabled(self.canvas.can_undo())
         self.prev_btn.setEnabled(self.current_index > 0)
         last = self.current_index >= len(self.reviews) - 1
@@ -763,7 +782,11 @@ class ReviewTab(QWidget):
             slices = sorted(by_animal[ai], key=lambda m: m.slice_index)
             n_ok = sum(1 for m in slices if m.accepted and m.mask.any())
             n_nonempty = sum(1 for m in slices if m.mask.any())
-            parent = QTreeWidgetItem([f"Животное {ai + 1}   ({n_ok}/{n_nonempty} принято)"])
+            title = f"Животное {ai + 1}"
+            own_group = animal_group(review.masks, ai)
+            if own_group and own_group != review.shot.group.name:
+                title += f" — группа «{own_group}»"
+            parent = QTreeWidgetItem([f"{title}   ({n_ok}/{n_nonempty} принято)"])
             parent.setBackground(0, QBrush(QColor(r, g, b)))
             parent.setForeground(0, QBrush(QColor(0, 0, 0)))
             font = parent.font(0)
@@ -800,6 +823,72 @@ class ReviewTab(QWidget):
         if key is not None:
             self.canvas.set_active_mask(*key)
             self._refresh_side()
+
+    # ---------- группа животного (сессия 12) ----------
+
+    def _known_groups(self) -> list[str]:
+        """Группы для меню: группы проекта (папок) и уже заведённые на проверке."""
+        names: list[str] = []
+        for r in self.reviews:
+            for name in [r.shot.group.name] + [m.group for m in r.masks if m.group]:
+                if name not in names:
+                    names.append(name)
+        return names
+
+    def _on_tree_context_menu(self, pos) -> None:
+        item = self.mask_tree.itemAt(pos)
+        key = item.data(0, Qt.ItemDataRole.UserRole) if item is not None else None
+        if key is None:
+            return
+        self.canvas.set_active_mask(*key)
+        self._refresh_side()
+        self._show_group_menu(self.mask_tree.viewport().mapToGlobal(pos))
+
+    def _show_group_menu(self, global_pos) -> None:
+        review = self._review()
+        m = self.canvas.active_mask()
+        if review is None or m is None:
+            return
+        folder_group = review.shot.group.name
+        current = animal_group(review.masks, m.animal_index) or folder_group
+        menu = QMenu(self)
+        title = menu.addAction(f"Группа животного {m.animal_index + 1}:")
+        title.setEnabled(False)
+        for name in self._known_groups():
+            text = f"{name}  (группа папки)" if name == folder_group else name
+            action = QAction(text, menu)
+            action.setCheckable(True)
+            action.setChecked(name == current)
+            action.triggered.connect(lambda _=False, n=name: self._set_active_group(n))
+            menu.addAction(action)
+        menu.addSeparator()
+        menu.addAction("Новая группа…", self._new_group_for_active)
+        menu.exec(global_pos)
+
+    def _new_group_for_active(self) -> None:
+        name, ok = QInputDialog.getText(
+            self, "Новая группа",
+            "Название группы для этого животного.\n"
+            "Если на вкладке «Проект» есть группа с таким же названием, животное попадёт "
+            "в неё (с её отметками «Контроль?» и «Условие»); иначе это будет опытная "
+            "группа без условия.",
+        )
+        name = name.strip()
+        if ok and name:
+            self._set_active_group(name)
+
+    def _set_active_group(self, name: str) -> None:
+        review = self._review()
+        m = self.canvas.active_mask()
+        if review is None or m is None:
+            return
+        group = None if name == review.shot.group.name else name
+        if animal_group(review.masks, m.animal_index) == group:
+            return
+        self.canvas.push_undo()
+        set_animal_group(review.masks, m.animal_index, group)
+        self._refresh_side()
+        self._mark_changed()
 
     def _refresh_exposure_combo(self, review: ShotReview) -> None:
         self.exposure_combo.clear()
@@ -1197,6 +1286,13 @@ class ResultsTab(QWidget):
         self.reviews = reviews
         self._refresh_table()
 
+    def _group_configs(self) -> dict[str, GroupConfig]:
+        """Название группы → её настройки (для животных со своей группой, сессия 12)."""
+        out: dict[str, GroupConfig] = {}
+        for r in self.reviews:
+            out.setdefault(r.shot.group.name, r.shot.group)
+        return out
+
     def _current_metric_key(self) -> str:
         return self.metric_combo.currentText().split(" ")[0]
 
@@ -1324,7 +1420,7 @@ class ResultsTab(QWidget):
                 continue
             for e in exposures:
                 image = load_image(review.shot.exposure_files[e])
-                rows.extend(measure_shot(review, image=image, exposure_ms=e))
+                rows.extend(measure_shot(review, image=image, exposure_ms=e, groups=self._group_configs()))
         return rows_to_dataframe(rows), skipped
 
     def _refresh_table(self) -> None:
@@ -1332,7 +1428,7 @@ class ResultsTab(QWidget):
         # показаны маски; значения яркости берутся потом на выбранной выдержке
         all_rows: list[MeasurementRow] = []
         for review in self.reviews:
-            all_rows.extend(measure_shot(review))
+            all_rows.extend(measure_shot(review, groups=self._group_configs()))
         self.slice_df = rows_to_dataframe(all_rows)
 
         self._refresh_exposure_options()
@@ -1484,7 +1580,7 @@ class ResultsTab(QWidget):
         groups = list({id(r.shot.group): r.shot.group for r in self.reviews}.values())
         if not groups:
             return prefix + suffix
-        stem = file_stem(prefix, groups[0].mode, [g.name for g in groups])
+        stem = file_stem(prefix, groups[0].mode, list(dict.fromkeys(g.name for g in groups)))
         return str(unique_path(data_dir_for(groups) / (stem + suffix)))
 
     def _animal_df(self) -> pd.DataFrame:
@@ -1699,7 +1795,8 @@ class PipelineTabs(QTabWidget):
         self.project_tab.restore_btn.setEnabled(bool(list_autosaves(self.mode)))
 
     def _group_names(self) -> list[str]:
-        return [g.name for g in self.groups]
+        # несколько папок одной группы — одно название (сессия 12)
+        return list(dict.fromkeys(g.name for g in self.groups))
 
     def has_markup(self) -> bool:
         return bool(self.review_tab.reviews)
